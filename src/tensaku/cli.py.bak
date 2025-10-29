@@ -1,0 +1,59 @@
+# Path: /home/esakit25/work/tensaku/src/tensaku/cli.py
+import argparse, os
+from .config import load_config
+from . import split as split_mod
+from . import train as train_mod
+from . import infer_pool as infer_pool_mod
+from . import confidence as confidence_mod
+from . import gate as gate_mod
+
+def _add_global_args(p: argparse.ArgumentParser):
+    p.add_argument(
+        "-c", "--config",
+        default=None,  # ← 必須をやめる
+        help="YAML config path (default: env $TSKCFG or ./configs/exp_al_hitl.yaml)",
+    )
+    p.add_argument(
+        "--set",
+        action="append",
+        default=[],
+        metavar="KEY=VAL",
+        help="Dot overrides (repeatable), e.g. run.seed=42 or data.input_all=/path",
+    )
+
+def cmd_split(cfg):      split_mod.run(cfg)
+def cmd_train(cfg):      train_mod.run(cfg)
+def cmd_infer_pool(cfg): infer_pool_mod.run(cfg)
+def cmd_conf(cfg):       confidence_mod.run(cfg)
+def cmd_gate(cfg):       gate_mod.run(cfg)
+def cmd_al_sample(cfg):  print("[todo] al-sample:", cfg.get("al"))
+def cmd_al_label_import(cfg): print("[todo] al-label-import")
+def cmd_al_cycle(cfg):   print("[todo] al-cycle:", cfg.get("al"))
+def cmd_viz(cfg):        print("[todo] viz:", cfg.get("viz"))
+def cmd_eval(cfg):       print("[todo] eval")
+
+def main():
+    root = argparse.ArgumentParser(prog="tensaku")
+    _add_global_args(root)  # ← グローバル引数をサブコマンドより先に定義
+
+    sub = root.add_subparsers(dest="cmd", required=True)
+    cmds = {
+        "split": cmd_split, "train": cmd_train, "infer-pool": cmd_infer_pool,
+        "confidence": cmd_conf, "gate": cmd_gate, "al-sample": cmd_al_sample,
+        "al-label-import": cmd_al_label_import, "al-cycle": cmd_al_cycle,
+        "viz": cmd_viz, "eval": cmd_eval,
+    }
+    for name, fn in cmds.items():
+        sp = sub.add_parser(name, help=f"{name} subcommand")
+        sp.set_defaults(func=fn)
+
+    args = root.parse_args()
+    # デフォルトの config 解決（-c 省略可）
+    cfg_path = args.config or os.getenv("TSKCFG") or "configs/exp_al_hitl.yaml"
+    if not os.path.exists(cfg_path):
+        root.error(f"Config not found: {cfg_path}. Use -c or set $TSKCFG.")
+    cfg = load_config(cfg_path, args.set)
+    args.func(cfg)
+
+if __name__ == "__main__":
+    main()

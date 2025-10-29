@@ -1,0 +1,23 @@
+Metadata-Version: 2.4
+Name: tensaku
+Version: 0.0.1
+Summary: Tensaku: Japanese SAS with Confidence, HITL, and Active Learning
+Author: Tetta Esaki
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: transformers>=4.44
+Requires-Dist: torch
+Requires-Dist: scikit-learn
+Requires-Dist: pandas
+Requires-Dist: numpy
+Requires-Dist: matplotlib
+Requires-Dist: pyyaml
+
+# Tensaku
+
+Config-first, plugin-ready toolkit for Japanese Short Answer Scoring (SAS) with Confidence, HITL, and Active Learning.
+
+## Quick start
+```bash
+pip install -e .
+tensaku -c configs/exp_al_hitl.yaml --help

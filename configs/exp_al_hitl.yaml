@@ -1,0 +1,96 @@
+run:
+  run_id: "R1"
+  seed: 42
+  out_dir: "/home/esakit25/work/tensaku/outputs"
+  data_dir: "/home/esakit25/work/tensaku/data_sas"
+
+data:
+  input_all: "/home/esakit25/work/tensaku/data_sas/all.jsonl"
+  files:
+    labeled: "labeled.jsonl"
+    pool: "pool.jsonl"
+    dev: "dev.jsonl"
+    test: "test.jsonl"
+  text_key_primary: "mecab"
+  text_key_fallback: "text"
+  label_key: "score"
+  id_key: "id"
+  max_len: 128
+
+split:
+  enable: false
+  ratios:
+    train: 0.7
+    dev: 0.15
+    test: 0.15
+  freeze_dev_test: true
+
+model:
+  name: "cl-tohoku/bert-base-japanese-v3"
+  head: "clf"
+  speed: "full"
+  num_labels: null
+
+train:
+  epochs: 5
+  batch_size: 16
+  lr_full: 2.0e-5
+  lr_frozen: 5.0e-4
+  early_stop_metric: "qwk"
+
+infer:
+  ckpt: "/home/esakit25/work/tensaku/outputs/checkpoints_min/best.pt"
+
+confidence:
+  estimators:
+    - name: "msp"
+    - name: "entropy"
+    - name: "trust"
+      k: 1
+      metric: "cosine"
+  calibration:
+    enable: true
+    method: "temperature"
+    ece_bins: 15
+
+hitl:
+  cse_abs_err: 2
+  eps_list: [0.02, 0.05]
+  safety_margin: 0.01
+  pseudo_label_thresh: 0.97
+
+al:
+  rounds: 10
+  budget: 50
+  sampler:
+    name: "hybrid"
+    alpha: 0.7
+    k_center: 200
+    uncertainty: "entropy"
+  backlog_bonus: 1.0
+  accept_policy: "tau"
+
+viz:
+  enable: true
+  plots:
+    - coverage_rmse
+    - coverage_cse
+    - reliability
+    - aurc
+    - learning_curve
+
+logging:
+  level: "INFO"
+
+confidence:
+  estimators:
+    - name: "msp"
+    - name: "entropy"
+    - name: "trust"
+      version: "v2"         # "v1"既定。v2でロバスト集約
+      metric: "cosine"      # v2推奨
+      k_list: [1, 3, 5]     # 上位k集合
+      agg: "median"         # "median" or "trimmed_mean"
+      trim_q: 0.1           # trimmed_mean用（任意）
+      normalize: "zscore"   # 任意（将来: "l2" を trust 内部で強制してもOK）
+

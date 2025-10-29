@@ -1,0 +1,26 @@
+[project]
+name = "tensaku"
+version = "0.0.1"
+description = "Tensaku: Japanese SAS with Confidence, HITL, and Active Learning"
+authors = [{name="Tetta Esaki"}]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "transformers>=4.44",
+  "torch",
+  "scikit-learn",
+  "pandas",
+  "numpy",
+  "matplotlib",
+  "pyyaml",
+]
+
+[project.scripts]
+tensaku = "tensaku.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
