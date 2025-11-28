@@ -1,21 +1,25 @@
+# /home/esakit25/work/tensaku/configs/exp_al_hitl.yaml
+
 run:
-  run_id: "R1"
+  run_id: R1
   seed: 42
-  out_dir: "/home/esakit25/work/tensaku/outputs"
-  data_dir: "/home/esakit25/work/tensaku/data_sas"
+  # out_dir, data_dir は al.sh で環境変数 QID/OUT_DIR/DATA_DIR から上書きされる前提
+  out_dir: /home/esakit25/work/tensaku/outputs/q-Y14_1-2_1_3
+  data_dir: /home/esakit25/work/tensaku/data_sas/splits/q-Y14_1-2_1_3
 
 data:
-  input_all: "/home/esakit25/work/tensaku/data_sas/all.jsonl"
+  input_all: /home/esakit25/work/tensaku/data_sas/all.jsonl
+  qid: Y14_1-2_1_3
   files:
-    labeled: "labeled.jsonl"
-    pool: "pool.jsonl"
-    dev: "dev.jsonl"
-    test: "test.jsonl"
-  text_key_primary: "mecab"
-  text_key_fallback: "text"
-  label_key: "score"
-  id_key: "id"
-  max_len: 128
+    labeled: labeled.jsonl
+    dev: dev.jsonl
+    test: test.jsonl
+    pool: pool.jsonl
+  text_key_primary: mecab
+  text_key_fallback: text
+  label_key: score
+  id_key: id
+  max_len: 96 # 高速化のため短縮
 
 split:
   enable: false
@@ -24,51 +28,46 @@ split:
     dev: 0.15
     test: 0.15
   freeze_dev_test: true
+  seed: 42
+  # n_train: 10 # Cold Start実験をする場合はここを有効化
 
 model:
-  name: "cl-tohoku/bert-base-japanese-v3"
-  head: "clf"
-  speed: "full"
-  num_labels: null
+  name: cl-tohoku/bert-base-japanese-v3
+  head: clf
+  speed: full
+  num_labels: 15
+  ckpt: null # 自動解決のためnull
 
 train:
-  epochs: 5
-  batch_size: 16
-  lr_full: 2.0e-5
-  lr_frozen: 5.0e-4
-  early_stop_metric: "qwk"
+  epochs: 5       # AL用に短縮
+  batch_size: 16  # 安定性重視
+  lr_full: 3.0e-05
+  lr_frozen: 0.0005
+  early_stop_metric: null
 
 infer:
-  ckpt: "/home/esakit25/work/tensaku/outputs/checkpoints_min/best.pt"
+  ckpt: null
+  trust_version: v2
+
+calibration:
+  enable: true
+  T_min: 0.5
+  T_max: 3.0
+  step: 0.05
+  n_bins: 15
 
 confidence:
   estimators:
-    - name: "msp"
-    - name: "entropy"
-    - name: "trust"
-      k: 1
-      metric: "cosine"
-  calibration:
-    enable: true
-    method: "temperature"
-    ece_bins: 15
-
-hitl:
-  cse_abs_err: 2
-  eps_list: [0.02, 0.05]
-  safety_margin: 0.01
-  pseudo_label_thresh: 0.97
-
-al:
-  rounds: 10
-  budget: 50
-  sampler:
-    name: "hybrid"
-    alpha: 0.7
-    k_center: 200
-    uncertainty: "entropy"
-  backlog_bonus: 1.0
-  accept_policy: "tau"
+  - name: msp
+  - name: entropy
+  - name: energy
+  - name: trust
+    version: v2
+    metric: cosine
+    k_list: [5] # 高速化のため単一指定
+    agg: median
+    trim_q: 0.1
+    normalize: zscore
 
 viz:
   enable: true
@@ -78,19 +77,41 @@ viz:
     - reliability
     - aurc
     - learning_curve
+  split_for_risk: "test"
+  risk_coverage_conf_keys:
+    - conf_msp
+    - conf_trust
+    - conf_entropy
+    - conf_energy
+  reliability_conf_keys:
+    - conf_msp
+  hist_multi_conf_keys:
+    - conf_msp
+    - conf_trust
+
+gate:
+  conf_name: conf_trust
+  eps_cse: 0.05
+  eps_list: [0.02, 0.05]
+  cse_abs_err: 2
+  accept_policy: '>=tau'
+
+hitl:
+  cse_abs_err: 2
+  eps_list: [0.02, 0.05]
+  safety_margin: 0.01
+
+# === 追加した AL セクション ===
+al:
+  rounds: 10          # デフォルトのラウンド数
+  budget: 50          # 1ラウンドあたりの追加数
+  seed: 42
+  
+  sampler:
+    name: uncertainty       # uncertainty, random, hybrid, clustering
+    uncertainty: trust      # msp, trust, entropy
+    alpha: 3.0              # Hybrid用: 不確実性で絞る倍率 (Budget * alpha)
+    k_center: 200           # 将来用
 
 logging:
-  level: "INFO"
-
-confidence:
-  estimators:
-    - name: "msp"
-    - name: "entropy"
-    - name: "trust"
-      version: "v2"         # "v1"既定。v2でロバスト集約
-      metric: "cosine"      # v2推奨
-      k_list: [1, 3, 5]     # 上位k集合
-      agg: "median"         # "median" or "trimmed_mean"
-      trim_q: 0.1           # trimmed_mean用（任意）
-      normalize: "zscore"   # 任意（将来: "l2" を trust 内部で強制してもOK）
-
+  level: INFO

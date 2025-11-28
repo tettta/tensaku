@@ -1,491 +1,470 @@
+# /home/esakit25/work/tensaku/src/tensaku/gate.py
 # -*- coding: utf-8 -*-
 """
-@module     tensaku.gate
-@role       HITLゲートの薄いオーケストレータ。
-@overview   devで温度校正→信頼度→τ探索（CSE<=ε を満たし coverage 最大）→pool/testへ固定適用。
-@inputs     - YAML設定: data_dir, outputs, gate.{conf_name,cse_abs_err,eps_list,accept_policy,pseudo_label_thresh}, calibration, confidence
-            - {outputs}/dev_detail.csv        : y_true, y_pred, conf_* [任意: logits_*]
-            - {outputs}/preds_detail.csv      : id, y_pred, conf_*     [任意: logits_*]
-@outputs    - {outputs}/hitl_summary.csv      : eps, tau, coverage, CSE, RMSE, QWK, ...
-            - {outputs}/accept.csv, hold.csv  : id, y_pred, conf, ...
-            - {outputs}/curve_coverage_rmse.png
-            - {outputs}/curve_coverage_cse_margin.png
-@cli        tensaku gate -c /home/esakit25/work/tensaku/configs/exp_al_hitl.yaml [--conf msp|trust ...]
-@notes      依存モジュールが未実装でも動くよう、内部実装にフォールバックを用意（calibration/trust 無しでも実行可）。
+@module   : tensaku.gate
+@role     : dev の予測CSVから閾値 τ を推定し、pool/test に仮想 HITL を適用して gate_* を保存する
+@inputs   :
+  - cfg["run"].out_dir   : 出力ディレクトリ（例: /.../outputs/q-Y14_1-2_1_3）
+  - cfg["run"].conf_key  : 使用する確信度列名（例: "conf_msp", "conf_msp_temp", "trust"）
+  - cfg["gate"].eps_cse      : dev 上で許容する重大誤採点率 CSE の上限（例: 0.10）
+  - cfg["gate"].cse_abs_err  : 重大誤採点とみなす |pred-true| の閾値（例: 4）
+  - CLI 引数（優先度: CLI > cfg > デフォルト）
+      --conf-key STR       : 使用する確信度列名
+      --eps-cse FLOAT      : dev 上の CSE 上限
+      --cse-abs-err INT    : CSE 判定用の絶対誤差
+@files_in :
+  - {out_dir}/preds_detail.csv  : split,id,y_true,y_pred,conf_* を含む CSV
+    （無い場合は dev/pool/test_preds.csv から組み立てを試みる）
+@outputs  :
+  - {out_dir}/gate_assign.csv   :
+        split,id,route,y_pred,<conf列...>,y_true(あれば),abs_err,severe_err
+        route は "auto"（conf>=τ） / "human"（それ以外）
+  - {out_dir}/gate_meta.json    :
+        {
+          "conf_key": ...,
+          "tau": ...,
+          "cse_abs_err": ...,
+          "eps_cse": ...,
+          "primary_split": "test"|"pool"|"dev",
+          "coverage": ...,
+          "rmse": ...,
+          "cse": ...,
+          "splits": {
+            "dev":  {"n":..., "n_labeled":..., "coverage":..., "rmse":..., "cse":...},
+            "pool": {...},
+            "test": {...}
+          }
+        }
+@cli     : tensaku gate -c configs/exp_al_hitl.yaml [--conf-key conf_msp] [--eps-cse 0.10] [--cse-abs-err 4]
+@deps    : pandas, numpy
+@notes   :
+  - 本モジュールは解析専用であり、data_sas/splits 以下の labeled/pool/test には一切触れない。
+  - 閾値 τ は dev のみから決定し、pool/test にはそのまま適用する（リーク防止）。
+  - coverage/RMSE/CSE は「auto ルートに流したサンプル」に対してのみ計算する。
 """
+
 from __future__ import annotations
 
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import argparse
-import dataclasses
-import math
+import json
 import os
-import sys
-import time
-from typing import Iterable, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
-# 可能ならプロジェクト内ユーティリティを使う（無ければ内部フォールバック）
-try:
-    from tensaku import metrics as _metrics
-except Exception:  # フォールバック
-    _metrics = None
 
-try:
-    from tensaku import calibration as _calib
-except Exception:
-    _calib = None
-
-try:
-    from tensaku import trustscore as _trust
-except Exception:
-    _trust = None
-
-# 🔧 1) 先頭付近（importの下）にヘルパを追加（重複があればスキップ可）
-CONF_PREFIX = "conf_"
-
-def _subset_accept_hold(df_pool, mask, conf_prefix: str = CONF_PREFIX):
-    """mask(1=accept/0=hold) で DataFrame を二分し、保存用の最小列に整形する。"""
-    if not isinstance(mask, (list, tuple, np.ndarray, pd.Series)):
-        raise RuntimeError("mask must be sequence-like (0/1).")
-    mask = np.array(mask).astype(int)
-    if len(mask) != len(df_pool):
-        raise RuntimeError(f"mask length mismatch: mask={len(mask)} df={len(df_pool)}")
-    cols_conf = [c for c in df_pool.columns if c.startswith(conf_prefix)]
-    cols_base = [c for c in ["id", "y_pred"] if c in df_pool.columns]
-    cols = cols_base + cols_conf
-    df_accept = df_pool[mask == 1][cols].copy()
-    df_hold   = df_pool[mask == 0][cols].copy()
-    return df_accept, df_hold
-
-def _load_pool_preds(out_dir: str) -> pd.DataFrame:
-    """preds_detail.csv が無ければ pool_preds.csv を探す後方互換ローダ。"""
-    p1 = os.path.join(out_dir, "preds_detail.csv")
-    p2 = os.path.join(out_dir, "pool_preds.csv")
-    for p in (p1, p2):
-        if os.path.isfile(p):
-            df = pd.read_csv(p)
-            if "y_pred" not in df.columns:
-                raise RuntimeError(f"missing column y_pred in {p}")
-            return df
-    raise RuntimeError(f"not found preds file: {p1} or {p2}")
-
-
-
-# ---------------------------
+# =====================================================================================
 # 小さなユーティリティ
-# ---------------------------
-def _rmse(pred: np.ndarray, y: np.ndarray) -> float:
-    return float(np.sqrt(np.mean((pred - y) ** 2)))
+# =====================================================================================
 
 
-def _qwk(pred: np.ndarray, y: np.ndarray, n_class: Optional[int] = None) -> float:
-    # フォールバックの簡易QWK（sklearn）
-    try:
-        from sklearn.metrics import cohen_kappa_score
-        return float(cohen_kappa_score(y, pred, weights="quadratic"))
-    except Exception:
-        return float("nan")
+@dataclass
+class GateConfig:
+    out_dir: str
+    conf_key: str
+    eps_cse: float
+    cse_abs_err: int
 
 
-def _cse_rate(pred: np.ndarray, y: np.ndarray, abs_err: int) -> float:
-    return float(np.mean(np.abs(pred - y) >= abs_err))
+def _load_preds_detail(out_dir: str) -> pd.DataFrame:
+    """preds_detail.csv をロード（無ければ dev/pool/test_preds.csv から組み立て）。
 
-
-def _softmax(logits: np.ndarray, T: float = 1.0) -> np.ndarray:
-    z = logits / float(T)
-    z = z - z.max(axis=1, keepdims=True)
-    e = np.exp(z)
-    return e / e.sum(axis=1, keepdims=True)
-
-
-def _now_str() -> str:
-    return time.strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def _read_yaml(path: str) -> dict:
-    import yaml
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _pick_conf_column(df: pd.DataFrame, conf_name: str) -> str:
+    期待カラム（最低限）:
+      - split: dev|pool|test
+      - id
+      - y_pred
+      - conf_*  （conf_key で指定された列）
+      - y_true （評価可能なら）
     """
-    conf_name='msp' なら conf_msp を優先、存在しなければ conf っぽい列から最大値を選ぶ。
+    path = os.path.join(out_dir, "preds_detail.csv")
+    if os.path.exists(path):
+        df = pd.read_csv(path)
+        if "split" not in df.columns:
+            raise RuntimeError(f"[gate] ERROR: 'split' column missing in {path}")
+        return df
+
+    # レガシー互換: dev_preds.csv / pool_preds.csv / test_preds.csv から統合を試みる
+    print(f"[gate] info: {path} not found. Falling back to *_preds.csv files.")
+    frames: List[pd.DataFrame] = []
+    for split in ("dev", "pool", "test"):
+        p = os.path.join(out_dir, f"{split}_preds.csv")
+        if not os.path.exists(p):
+            continue
+        df_s = pd.read_csv(p)
+        df_s["split"] = split
+        frames.append(df_s)
+    if not frames:
+        raise FileNotFoundError(
+            f"[gate] ERROR: neither preds_detail.csv nor *_preds.csv found in {out_dir}"
+        )
+    df_all = pd.concat(frames, ignore_index=True)
+    return df_all
+
+
+def _cse_rate(y_true: np.ndarray, y_pred: np.ndarray, abs_err_th: int) -> float:
+    """重大誤採点率（CSE）を計算する。
+
+    CSE = mean(|pred - true| >= abs_err_th)
+    サンプル数 0 のときは 0.0 を返す。
     """
-    key = f"conf_{conf_name}"
-    if key in df.columns:
-        return key
-    # ゆるいフォールバック
-    candidates = [c for c in df.columns if c.startswith("conf_")]
-    if len(candidates) == 1:
-        return candidates[0]
-    # 最後のフォールバック
-    return key  # たとえ無くてもこの名前で後段がわかる
+    if y_true.size == 0:
+        return 0.0
+    err = np.abs(y_pred - y_true)
+    return float(np.mean(err >= abs_err_th))
 
 
-# ---------------------------
-# API: Temperature on dev
-# ---------------------------
-def fit_temperature_on_dev(dev_df: pd.DataFrame, logits_prefix: str = "logits_", label_col: str = "y_true") -> Optional[float]:
+def _rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """RMSE を計算（サンプル数 0 のときは 0.0）。"""
+    if y_true.size == 0:
+        return 0.0
+    diff = y_pred - y_true
+    return float(np.sqrt(np.mean(diff * diff)))
+
+
+def _find_tau_for_cse_constraint_prefix(
+    conf: np.ndarray,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    eps_cse: float,
+    abs_err_th: int,
+) -> Tuple[Optional[float], float, float, float]:
+    """dev 上で CSE≤eps_cse を満たしつつ coverage 最大となる τ を探索（prefix 走査）。
+
+    手順:
+      - conf の NaN を除外
+      - まず「全体の CSE」がすでに eps_cse 以下なら、全件 auto として即終了
+      - conf 降順にソートし、上位 k 件を auto とみなす
+      - k=1..n について CSE を評価し、条件 CSE≤eps_cse を満たす最大 k を採用
+      - τ は「採用された集合の中で最も低い conf 値」とする
+
+    戻り値: (tau, coverage, cse, rmse)
+      - tau が None の場合は「条件を満たす τ が存在しない」ことを意味する
+        （coverage=0, cse=0, rmse=0 とする）。
     """
-    dev上のlogits_* から温度Tを推定。logits列が無い場合は None を返す。
-    """
-    logit_cols = [c for c in dev_df.columns if c.startswith(logits_prefix)]
-    if not logit_cols or label_col not in dev_df.columns:
-        return None
+    # NaN を除外
+    mask_valid = ~np.isnan(conf)
+    conf = conf[mask_valid]
+    y_true = y_true[mask_valid]
+    y_pred = y_pred[mask_valid]
 
-    logits = dev_df[logit_cols].to_numpy(dtype=np.float64)
-    labels = dev_df[label_col].to_numpy(dtype=int)
+    n = conf.size
+    if n == 0:
+        return None, 0.0, 0.0, 0.0
 
-    if _calib and hasattr(_calib, "tune_temperature"):
-        # プロジェクト実装がある場合
-        return float(_calib.tune_temperature(logits, labels))
-    else:
-        # フォールバック: 0.5～3.0 を0.1刻みでECE最小を探索（簡易）
-        def ece_of_T(T: float) -> float:
-            p = _softmax(logits, T=T)
-            conf = p.max(axis=1)
-            pred = p.argmax(axis=1)
-            bins = np.linspace(0.0, 1.0, 16)
-            idx = np.digitize(conf, bins, right=True)
-            ece = 0.0
-            for b in range(len(bins)):
-                m = idx == b
-                if not np.any(m):
-                    continue
-                acc = np.mean(pred[m] == labels[m])
-                gap = abs(acc - np.mean(conf[m]))
-                ece += gap * (np.sum(m) / len(conf))
-            return ece
+    # まず「全体の CSE」がすでに eps_cse 以下なら、全件 auto にして終了
+    cse_all = _cse_rate(y_true, y_pred, abs_err_th)
+    if cse_all <= eps_cse:
+        tau = float(conf.min())  # conf >= tau で全件 auto
+        cov = 1.0
+        rmse_all = _rmse(y_true, y_pred)
+        return tau, cov, cse_all, rmse_all
 
-        Ts = np.arange(0.5, 3.01, 0.1)
-        eces = [ece_of_T(float(T)) for T in Ts]
-        return float(Ts[int(np.argmin(eces))])
-
-
-# ---------------------------
-# API: compute_confidences
-# ---------------------------
-def compute_confidences(df: pd.DataFrame, conf_name: str, T: Optional[float] = None,
-                        logits_prefix: str = "logits_") -> np.ndarray:
-    """
-    conf列があればそれを使用。なければ logits から (温度T付きで) MSP を計算。
-    """
-    col = _pick_conf_column(df, conf_name)
-    if col in df.columns:
-        return df[col].to_numpy(dtype=float)
-
-    # フォールバック: logits_* から MSP を作る
-    logit_cols = [c for c in df.columns if c.startswith(logits_prefix)]
-    if logit_cols:
-        logits = df[logit_cols].to_numpy(dtype=np.float64)
-        p = _softmax(logits, 1.0 if T is None else float(T))
-        return p.max(axis=1)
-
-    # すべて無い場合は定数（受け入れゼロ回避のため）※実務では警告
-    return np.zeros(len(df), dtype=float)
-
-
-# ---------------------------
-# API: score_trust
-# ---------------------------
-def score_trust(df_pool: pd.DataFrame) -> Optional[np.ndarray]:
-    """
-    TrustScore を計算（プロジェクトの trustscore 実装があればそれを使用）。
-    ここでは conf_trust 列があればそれを返し、無ければ None。
-    """
-    if "conf_trust" in df_pool.columns:
-        return df_pool["conf_trust"].to_numpy(dtype=float)
-    # 将来: _trust を使って CLS埋め込みから算出
-    return None
-
-
-# ---------------------------
-# API: find_tau_for_constraint
-# ---------------------------
-def find_tau_for_constraint(y_pred: np.ndarray, y_true: np.ndarray, conf: np.ndarray,
-                            eps: float, cse_abs_err: int, higher_is_better: bool = True) -> Tuple[float, float]:
-    """
-    dev上で CSE ≤ eps を満たしつつ coverage 最大の τ を探索。
-    戻り値: (best_coverage, tau)。満たせない場合は (0.0, +inf / -inf) を返す。
-    """
-    n = len(conf)
-    order = np.argsort(conf * (1 if higher_is_better else -1))[::-1]  # 降順（higher=True）/昇順（False）
-    y_pred_sorted = y_pred[order]
-    y_true_sorted = y_true[order]
-    conf_sorted = conf[order]
-
-    best_cov = 0.0
-    best_tau = -math.inf if higher_is_better else math.inf
-
-    for k in range(1, n + 1):
-        cse = _cse_rate(y_pred_sorted[:k], y_true_sorted[:k], cse_abs_err)
-        cov = k / n
-        if cse <= eps and cov >= best_cov:
-            best_cov = cov
-            best_tau = conf_sorted[k - 1]
-
-    if best_cov == 0.0:
-        return 0.0, (math.inf if higher_is_better else -math.inf)
-    return best_cov, float(best_tau)
-
-
-# ---------------------------
-# API: decide_mask
-# ---------------------------
-def decide_mask(conf: np.ndarray, tau: float, higher_is_better: bool = True) -> np.ndarray:
-    """
-    conf と τ から accept(1)/hold(0) のマスクを返す。
-    """
-    if higher_is_better:
-        return (conf >= tau).astype(np.int32)
-    else:
-        return (conf <= tau).astype(np.int32)
-
-
-# ---------------------------
-# API: save_gate_csv
-# ---------------------------
-def save_gate_csv(out_dir: str, summary_row: dict,
-                  df_accept: pd.DataFrame, df_hold: pd.DataFrame) -> None:
-    _ensure_dir(out_dir)
-    # hitl_summary.csv へ追記
-    path_sum = os.path.join(out_dir, "hitl_summary.csv")
-    row = {**summary_row}
-    row["timestamp"] = _now_str()
-    if os.path.exists(path_sum):
-        pd.DataFrame([row]).to_csv(path_sum, mode="a", header=False, index=False)
-    else:
-        pd.DataFrame([row]).to_csv(path_sum, index=False)
-
-    # accept/hold 明細
-    df_accept.to_csv(os.path.join(out_dir, "accept.csv"), index=False)
-    df_hold.to_csv(os.path.join(out_dir, "hold.csv"), index=False)
-
-
-# ---------------------------
-# 可視化（最小版）
-# ---------------------------
-def _save_curves(out_dir: str, y_true: np.ndarray, y_pred: np.ndarray, conf: np.ndarray, cse_abs_err: int) -> None:
-    """
-    coverage–RMSE / coverage–CSE を描く最小版。既存 plots があれば置き換えてください。
-    """
-    import matplotlib.pyplot as plt
-
-    order = np.argsort(conf)[::-1]  # 高確信度から順に採用
+    # conf 降順にソート
+    order = np.argsort(conf)[::-1]
+    conf_s = conf[order]
     y_true_s = y_true[order]
     y_pred_s = y_pred[order]
-    conf_s = conf[order]
 
-    covs, rmses, cses = [], [], []
-    for k in range(1, len(conf_s) + 1):
-        covs.append(k / len(conf_s))
-        rmses.append(_rmse(y_pred_s[:k], y_true_s[:k]))
-        cses.append(_cse_rate(y_pred_s[:k], y_true_s[:k], cse_abs_err))
+    best_k = 0
+    best_cov = 0.0
+    best_cse = 0.0
+    best_rmse = 0.0
 
-    # RMSE曲線
-    plt.figure()
-    plt.plot(covs, rmses)
-    plt.xlabel("coverage")
-    plt.ylabel("RMSE")
-    plt.title("coverage–RMSE")
-    _ensure_dir(out_dir)
-    plt.savefig(os.path.join(out_dir, "curve_coverage_rmse.png"))
-    plt.close()
+    for k in range(1, n + 1):
+        idx = slice(0, k)
+        yt = y_true_s[idx]
+        yp = y_pred_s[idx]
+        cse = _cse_rate(yt, yp, abs_err_th)
+        if cse > eps_cse:
+            continue
+        cov = k / n
+        rmse = _rmse(yt, yp)
+        if cov > best_cov:
+            best_cov = cov
+            best_k = k
+            best_cse = cse
+            best_rmse = rmse
 
-    # CSE曲線
-    plt.figure()
-    plt.plot(covs, cses)
-    plt.axhline(0.02, linestyle="--")
-    plt.axhline(0.05, linestyle="--")
-    plt.xlabel("coverage")
-    plt.ylabel(f"CSE(|err|≥{cse_abs_err})")
-    plt.title("coverage–CSE")
-    plt.savefig(os.path.join(out_dir, "curve_coverage_cse_margin.png"))
-    plt.close()
+    if best_k == 0:
+        # 条件を満たす τ が存在しなかった場合：coverage=0 で返す
+        return None, 0.0, 0.0, 0.0
 
-
-# ---------------------------
-# メイン実行
-# ---------------------------
-@dataclasses.dataclass
-class GateConfig:
-    conf_name: str = "msp"
-    cse_abs_err: int = 2
-    eps_list: Tuple[float, ...] = (0.02, 0.05)
-    accept_policy: str = "tau"      # 未来拡張用
-    pseudo_label_thresh: Optional[float] = None
-    higher_is_better: bool = True
+    tau = float(conf_s[best_k - 1])
+    return tau, best_cov, best_cse, best_rmse
 
 
-def _load_io(cfg: dict) -> Tuple[str, str, pd.DataFrame, pd.DataFrame, GateConfig]:
-    data_dir = cfg.get("data_dir") or cfg.get("DATA_DIR")
-    out_dir = cfg.get("outputs") or cfg.get("OUT_DIR") or os.path.join(os.getcwd(), "outputs")
+def _summarize_split(
+    df: pd.DataFrame,
+    conf_key: str,
+    tau: Optional[float],
+    cse_abs_err: int,
+) -> Dict[str, Any]:
+    """特定 split に対する coverage/RMSE/CSE を要約する。"""
+    n_total = int(len(df))
+    if n_total == 0:
+        return {
+            "n": 0,
+            "n_labeled": 0,
+            "coverage": 0.0,
+            "rmse": 0.0,
+            "cse": 0.0,
+        }
 
-    gate_cfg = cfg.get("gate", {}) or {}
-    g = GateConfig(
-        conf_name=gate_cfg.get("conf_name", "msp"),
-        cse_abs_err=int(gate_cfg.get("cse_abs_err", 2)),
-        eps_list=tuple(gate_cfg.get("eps_list", [0.02, 0.05])),
-        accept_policy=str(gate_cfg.get("accept_policy", "tau")),
-        pseudo_label_thresh=gate_cfg.get("pseudo_label_thresh", None),
-        higher_is_better=True,  # MSP/Trust は高いほど良い
+    has_label = "y_true" in df.columns and df["y_true"].notna().any()
+    if has_label:
+        df_l = df[df["y_true"].notna()].copy()
+    else:
+        df_l = df.iloc[0:0].copy()  # 空
+    n_labeled = int(len(df_l))
+
+    if tau is None or n_labeled == 0:
+        return {
+            "n": n_total,
+            "n_labeled": n_labeled,
+            "coverage": 0.0,
+            "rmse": 0.0,
+            "cse": 0.0,
+        }
+
+    conf = df_l[conf_key].to_numpy(dtype=float)
+    y_true = df_l["y_true"].to_numpy(dtype=int)
+    y_pred = df_l["y_pred"].to_numpy(dtype=int)
+
+    mask_auto = conf >= tau
+    if mask_auto.sum() == 0:
+        cov = 0.0
+        cse = 0.0
+        rmse = 0.0
+    else:
+        cov = float(mask_auto.mean())
+        yt_a = y_true[mask_auto]
+        yp_a = y_pred[mask_auto]
+        cse = _cse_rate(yt_a, yp_a, cse_abs_err)
+        rmse = _rmse(yt_a, yp_a)
+
+    return {
+        "n": n_total,
+        "n_labeled": n_labeled,
+        "coverage": cov,
+        "rmse": rmse,
+        "cse": cse,
+    }
+
+
+def _choose_primary_split(summaries: Dict[str, Dict[str, Any]]) -> str:
+    """gate_meta.json の coverage/cse/rmse をどの split から取るか決める。
+
+    優先順位: test -> pool -> dev
+    """
+    for key in ("test", "pool", "dev"):
+        s = summaries.get(key)
+        if s and s.get("n_labeled", 0) > 0:
+            return key
+    # すべてラベルなしなら、何かしら存在する split を返す（なければ dev）
+    for key in ("test", "pool", "dev"):
+        if key in summaries:
+            return key
+    return "dev"
+
+
+def _build_gate_config(argv: Optional[List[str]], cfg: Dict[str, Any]) -> GateConfig:
+    """CLI 引数と cfg から GateConfig を組み立てる。"""
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--conf-key", dest="conf_key", type=str, default=None)
+    ap.add_argument("--eps-cse", dest="eps_cse", type=float, default=None)
+    ap.add_argument("--cse-abs-err", dest="cse_abs_err", type=int, default=None)
+    ns, _rest = ap.parse_known_args(argv or [])
+
+    run_cfg = cfg.get("run") or {}
+    gate_cfg = cfg.get("gate") or {}
+
+    out_dir = run_cfg.get("out_dir") or "./outputs"
+    out_dir = str(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # conf_key の優先順位: CLI > run.conf_key > gate.conf_key > "conf_msp"
+    conf_key = ns.conf_key or run_cfg.get("conf_key") or gate_cfg.get("conf_key") or "conf_msp"
+
+    # eps_cse の優先順位: CLI > gate.eps_cse > デフォルト 0.05
+    eps_cse = ns.eps_cse if ns.eps_cse is not None else gate_cfg.get("eps_cse", 0.05)
+
+    # cse_abs_err の優先順位: CLI > gate.cse_abs_err > デフォルト 2
+    cse_abs_err = ns.cse_abs_err if ns.cse_abs_err is not None else gate_cfg.get("cse_abs_err", 2)
+
+    print(f"[gate] out_dir     : {out_dir}")
+    print(f"[gate] conf_key    : {conf_key}")
+    print(f"[gate] eps_cse     : {eps_cse}")
+    print(f"[gate] cse_abs_err : {cse_abs_err}")
+
+    return GateConfig(out_dir=out_dir, conf_key=conf_key, eps_cse=eps_cse, cse_abs_err=cse_abs_err)
+
+
+# =====================================================================================
+# メイン処理
+# =====================================================================================
+
+
+def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
+    """tensaku gate メインエントリ。
+
+    手順:
+      1) preds_detail.csv を読み取り、dev/pool/test に分割
+      2) dev の conf_key を用いて閾値 τ を探索（CSE≤eps_cse で coverage 最大）
+      3) τ を pool/test に適用し、gate_assign.csv と gate_meta.json を出力
+    """
+    gc = _build_gate_config(argv, cfg)
+
+    # preds_detail を読み込み
+    try:
+        df = _load_preds_detail(gc.out_dir)
+    except Exception as e:
+        print(f"[gate] ERROR: failed to load predictions: {e}")
+        return 1
+
+    if gc.conf_key not in df.columns:
+        print(f"[gate] ERROR: column '{gc.conf_key}' not found in preds detail.")
+        print("[gate]        Available columns:", list(df.columns))
+        return 1
+
+    # dev 部分を抽出（ラベル付きのみ）
+    df_dev = df[df["split"] == "dev"].copy()
+    if "y_true" not in df_dev.columns or not df_dev["y_true"].notna().any():
+        print("[gate] ERROR: no labeled rows for dev split='dev'")
+        return 1
+    df_dev = df_dev[df_dev["y_true"].notna()].copy()
+
+    conf_dev = df_dev[gc.conf_key].to_numpy(dtype=float)
+    y_true_dev = df_dev["y_true"].to_numpy(dtype=int)
+    y_pred_dev = df_dev["y_pred"].to_numpy(dtype=int)
+
+    print(f"[gate] dev: n={len(df_dev)} (labeled) for threshold search")
+
+    # 1st: prefix 走査で τ を探索
+    tau, cov_dev, cse_dev, rmse_dev = _find_tau_for_cse_constraint_prefix(
+        conf_dev, y_true_dev, y_pred_dev, gc.eps_cse, gc.cse_abs_err
     )
 
-    dev_path = os.path.join(out_dir, "dev_detail.csv")
-    pool_path = os.path.join(out_dir, "preds_detail.csv")
-    if not os.path.isfile(dev_path):
-        raise RuntimeError(f"missing: {dev_path}")
-    if not os.path.isfile(pool_path):
-        raise RuntimeError(f"missing: {pool_path}")
-
-    dev_df = pd.read_csv(dev_path)
-    pool_df = pd.read_csv(pool_path)
-    return out_dir, data_dir, dev_df, pool_df, g
-
-
-def run(argv: Optional[Iterable[str]] = None, cfg: Optional[dict] = None) -> int:
-    """
-    CLIエントリ。例:
-      tensaku gate -c /home/esakit25/work/tensaku/configs/exp_al_hitl.yaml --conf msp
-    """
-    parser = argparse.ArgumentParser(prog="tensaku gate", description="HITL gate (devでτ探索→pool/testへ適用)")
-    parser.add_argument("-c", "--config", type=str, required=(cfg is None), help="YAML config path")
-    parser.add_argument("--conf", type=str, choices=["msp", "trust", "entropy", "energy", "margin"], default=None)
-    parser.add_argument("--eps", type=float, nargs="*", default=None, help="CSE上限の候補（例: 0.02 0.05）")
-    parser.add_argument("--cse-abs-err", type=int, default=None)
-    parser.add_argument("--no-calib", action="store_true", help="温度校正をスキップ")
-    parser.add_argument("--save-fig", action="store_true")
-    # ★ 追加
-    parser.add_argument("--no-infer", action="store_true", help="内部推論を一切行わず、既存ファイルのみ使用する")
-    parser.add_argument("--preds", type=str, default=None, help="pool予測CSV（preds_detail.csv互換）を明示指定")
-    args, _ = parser.parse_known_args(list(argv) if argv is not None else None)
-
-    # 設定ロード
-    yml = {} if cfg is None else cfg
-    if cfg is None:
-        yml = _read_yaml(args.config)
-    out_dir, data_dir, dev_df, pool_df, g = _load_io(yml)
-
-    # 引数で上書き
-    if args.conf:
-        g.conf_name = args.conf
-    if args.eps:
-        g.eps_list = tuple(float(x) for x in args.eps)
-    if args.cse_abs_err is not None:
-        g.cse_abs_err = int(args.cse_abs_err)
-
-    # 1) 温度推定（任意）
-    T = None
-    if not args.no_calib:
-        T = fit_temperature_on_dev(dev_df)  # 失敗(None)でも続行OK
-
-    # 2) dev/pool の信頼度列の決定
-    conf_dev = compute_confidences(dev_df, g.conf_name, T=T)
-
-    # ★ poolの確定：--preds > pool_df > （最後の手段として既定ファイル探索）
-    if args.preds:
-        df_pool = pd.read_csv(args.preds)
-    elif pool_df is not None and len(pool_df) > 0:
-        df_pool = pool_df
-    else:
-        # 既定の出力場所から拾う（存在しなければ明示エラー）
-        try:
-            df_pool = _load_pool_preds(out_dir)
-        except Exception as e:
-            raise RuntimeError(
-                f"[gate] pool predictions not found. "
-                f"先に infer-pool を実行するか、--preds で明示してください: {e}"
+    # 2nd: それでも τ が見つからない場合、dev 全体で CSE≤eps_cse なら「全件 auto」にフォールバック
+    if tau is None:
+        cse_all = _cse_rate(y_true_dev, y_pred_dev, gc.cse_abs_err)
+        rmse_all = _rmse(y_true_dev, y_pred_dev)
+        if cse_all <= gc.eps_cse:
+            tau = float(np.nanmin(conf_dev))  # dev 全体を auto にする最小 conf
+            cov_dev = 1.0
+            cse_dev = cse_all
+            rmse_dev = rmse_all
+            print(
+                f"[gate] INFO: prefix search found no tau, but CSE_all={cse_all:.4f}<=eps_cse."
+                " Fallback to tau=min(conf_dev) (coverage=1.0)."
             )
-
-    # 再推論の完全抑止
-    if args.no_infer:
-        print("[gate] --no-infer: 内部推論は行いません（既存CSVのみ使用）")
-
-    # pool側の信頼度
-    conf_pool = compute_confidences(df_pool, g.conf_name, T=T)
-    if g.conf_name == "trust":
-        tr = score_trust(df_pool)
-        if tr is not None:
-            conf_pool = tr
-
-    # devの真値・予測
-    y_true_dev = dev_df["y_true"].to_numpy(int)
-    y_pred_dev = dev_df["y_pred"].to_numpy(int)
-
-    # poolの予測
-    if "y_pred" not in df_pool.columns:
-        raise RuntimeError("df_pool に y_pred 列がありません（preds_detail互換のCSVを指定してください）")
-    y_pred_pool = df_pool["y_pred"].to_numpy(int)
-
-    # 集計
-    all_rows = []
-    best_for_plot = None
-
-    for eps in g.eps_list:
-        cov_dev, tau = find_tau_for_constraint(
-            y_pred_dev, y_true_dev, conf_dev,
-            eps=eps, cse_abs_err=g.cse_abs_err,
-            higher_is_better=g.higher_is_better
-        )
-
-        # --- τで二分（pool/test） ---
-        mask_te = decide_mask(conf_pool, tau, higher_is_better=g.higher_is_better)
-        df_accept, df_hold = _subset_accept_hold(df_pool, mask_te, conf_prefix=CONF_PREFIX)
-
-        # --- dev側も τを適用して“受け入れサブセット”品質 ---
-        mask_dev = decide_mask(conf_dev, tau, higher_is_better=g.higher_is_better)
-        if mask_dev.sum() > 0:
-            y_pred_dev_acc = y_pred_dev[mask_dev == 1]
-            y_true_dev_acc = y_true_dev[mask_dev == 1]
-            cse_at_tau = _cse_rate(y_pred_dev_acc, y_true_dev_acc, g.cse_abs_err)
-            rmse_at_tau = _rmse(y_pred_dev_acc, y_true_dev_acc)
-            n_class = int(max(y_true_dev.max(), y_pred_dev.max()) + 1)
-            qwk_at_tau = _qwk(y_pred_dev_acc, y_true_dev_acc, n_class=n_class)
-            coverage_dev = float(mask_dev.mean())
         else:
-            cse_at_tau = float("nan")
-            rmse_at_tau = float("nan")
-            qwk_at_tau = float("nan")
-            coverage_dev = 0.0
+            print(
+                f"[gate] WARN: no tau satisfies CSE<=eps_cse (eps={gc.eps_cse}). "
+                "         Falling back to coverage=0 (all samples -> human)."
+            )
+            tau = float("inf")  # conf>=inf は常に False → coverage=0
+            cov_dev = 0.0
+            cse_dev = 0.0
+            rmse_dev = 0.0
 
-        row = dict(
-            eps=float(eps),
-            tau=float(tau),
-            coverage=float(float(mask_te.mean())),  # pool/test 側 coverage
-            CSE=float(cse_at_tau),                  # dev受け入れサブセットのCSE
-            RMSE=float(rmse_at_tau),                # dev受け入れサブセットのRMSE
-            QWK=float(qwk_at_tau),                  # dev受け入れサブセットのQWK
-            coverage_dev=float(coverage_dev),       # dev側 coverage（参考）
-            conf_name=g.conf_name,
-            cse_abs_err=int(g.cse_abs_err),
+    print(f"[gate] selected tau={tau:.6f}  (dev coverage={cov_dev:.3f}, CSE={cse_dev:.4f}, RMSE={rmse_dev:.4f})")
+
+    # split ごとの要約
+    summaries: Dict[str, Dict[str, Any]] = {}
+    for split in ("dev", "pool", "test"):
+        df_s = df[df["split"] == split].copy()
+        if len(df_s) == 0:
+            continue
+        summaries[split] = _summarize_split(df_s, gc.conf_key, tau, gc.cse_abs_err)
+        s = summaries[split]
+        print(
+            f"[gate] {split}: n={s['n']}, n_labeled={s['n_labeled']}, "
+            f"coverage={s['coverage']:.3f}, CSE={s['cse']:.4f}, RMSE={s['rmse']:.4f}"
         )
 
-        cols_conf = [c for c in df_accept.columns if c.startswith(CONF_PREFIX)]
-        save_gate_csv(
-            out_dir,
-            row,
-            df_accept[["id", "y_pred"] + cols_conf] if "id" in df_accept.columns else df_accept,
-            df_hold  [["id", "y_pred"] + cols_conf] if "id" in df_hold.columns   else df_hold,
-        )
+    # gate_assign.csv を作成（pool/test を対象）
+    df_assign_src = df[df["split"].isin(["pool", "test"])].copy()
+    if df_assign_src.empty:
+        print("[gate] WARN: no pool/test rows found. gate_assign.csv will contain 0 rows.")
+    conf = df_assign_src[gc.conf_key].to_numpy(dtype=float)
+    route = np.where(conf >= tau, "auto", "human")
+    df_assign = pd.DataFrame(
+        {
+            "split": df_assign_src["split"].to_list(),
+            "id": df_assign_src["id"].to_list(),
+            "route": route,
+            "y_pred": df_assign_src["y_pred"].to_list(),
+            gc.conf_key: conf,
+        }
+    )
 
-        all_rows.append(row)
-        if best_for_plot is None:
-            best_for_plot = (y_true_dev, y_pred_dev, conf_dev)
+    # 他の conf_* 列や y_true があれば付け足す（解析用）
+    extra_cols = [
+        c
+        for c in df_assign_src.columns
+        if c not in df_assign.columns and c not in {"split", "id"}
+    ]
+    for col in extra_cols:
+        df_assign[col] = df_assign_src[col].to_list()
 
-    if args.save_fig and best_for_plot is not None:
-        _save_curves(out_dir, *best_for_plot, cse_abs_err=g.cse_abs_err)
+    # 評価用に絶対誤差と severe_err フラグ（ラベルがあれば）
+    if "y_true" in df_assign.columns:
+        yt = pd.to_numeric(df_assign["y_true"], errors="coerce")
+        yp = pd.to_numeric(df_assign["y_pred"], errors="coerce")
+        abs_err = (yp - yt).abs()
+        df_assign["abs_err"] = abs_err
+        df_assign["severe_err"] = abs_err >= gc.cse_abs_err
 
-    print(f"[gate] done. summary rows: {len(all_rows)}  -> {os.path.join(out_dir,'hitl_summary.csv')}")
+    out_assign = os.path.join(gc.out_dir, "gate_assign.csv")
+    df_assign.to_csv(out_assign, index=False)
+    print(f"[gate] wrote gate_assign.csv -> {out_assign} (n={len(df_assign)})")
+
+    # gate_meta.json を作成
+    primary = _choose_primary_split(summaries) if summaries else "dev"
+    primary_summary = summaries.get(primary, {"coverage": 0.0, "rmse": 0.0, "cse": 0.0})
+
+    meta: Dict[str, Any] = {
+        "conf_key": gc.conf_key,
+        "tau": float(tau),
+        "cse_abs_err": int(gc.cse_abs_err),
+        "eps_cse": float(gc.eps_cse),
+        "primary_split": primary,
+        "coverage": float(primary_summary.get("coverage", 0.0)),
+        "rmse": float(primary_summary.get("rmse", 0.0)),
+        "cse": float(primary_summary.get("cse", 0.0)),
+        "splits": summaries,
+    }
+
+    out_meta = os.path.join(gc.out_dir, "gate_meta.json")
+    with open(out_meta, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"[gate] wrote gate_meta.json -> {out_meta}")
+
     return 0
 
 
+if __name__ == "__main__":  # 直叩き用（開発時向け）
+    import sys
+    from tensaku.config import load_config
 
-if __name__ == "__main__":
-    sys.exit(run())
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-c", "--config", required=True)
+    parser.add_argument("--conf-key", dest="conf_key", type=str, default=None)
+    parser.add_argument("--eps-cse", dest="eps_cse", type=float, default=None)
+    parser.add_argument("--cse-abs-err", dest="cse_abs_err", type=int, default=None)
+    args, rest = parser.parse_known_args()
+
+    cfg = load_config(args.config, [])
+    cli_argv: List[str] = []
+    if args.conf_key is not None:
+        cli_argv.extend(["--conf-key", args.conf_key])
+    if args.eps_cse is not None:
+        cli_argv.extend(["--eps-cse", str(args.eps_cse)])
+    if args.cse_abs_err is not None:
+        cli_argv.extend(["--cse-abs-err", str(args.cse_abs_err)])
+
+    cli_argv.extend(rest)
+    sys.exit(run(cli_argv, cfg))

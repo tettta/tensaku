@@ -12,13 +12,14 @@ __pycache__/
 .vscode/
 
 # Experiments / datasets (必要なら調整)
-scripts/
 data_sas/
-data/
-datasets/
 
 # Outputs 全体は無視（必要時に例外を足す）
 outputs/
+logs/
+
+# memo
+docs/
 
 # でかいバイナリ
 *.npy
@@ -27,7 +28,15 @@ outputs/
 *.bin
 *.ckpt
 *.onnx
+*.pt
+*.pth
+*.ckpt
 
 # filter-branch の作業バックアップを無視
 .git.bak*/
 .git.bak.*/
+
+# --- その他 ---
+.vscode/
+.idea/
+*.log

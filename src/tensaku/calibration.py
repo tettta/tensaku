@@ -1,24 +1,26 @@
 # /home/esakit25/work/tensaku/src/tensaku/calibration.py
 """
-@module: tensaku.calibration
-@role: Temperature scaling (T) and calibration metrics (NLL/ECE) with reliability bins.
-@inputs:
-  - logits: ndarray (N, C)               ※基本は logits 入力を想定（Tスケーリングは logits/T）
-  - y:      ndarray (N,) int in [0..C-1]
-  - probs:  ndarray (N, C)               ※信頼度計算や可視化用（必要に応じて）
-@outputs:
-  - TemperatureScaler.fit(...) -> float  （devで最良T）
-  - TemperatureScaler.transform_logits(logits) -> logits' (= logits / T)
-  - nll_from_logits(logits, y, T=1.0) -> float
-  - ece(probs, y, n_bins=15) -> float
-  - reliability_bins(probs, y, n_bins=15) -> dict( per-bin stats )
-@cli: 直接のCLIは持たない。tensaku gate / tensaku infer-pool 等から内部利用。
-@notes:
-  - 実運用では dev で T を推定し、pool/test では **推定済みTを固定適用**（リーク防止）。
-  - 最適化は安全・軽量な **グリッドサーチ**（既定: T∈[0.5, 3.0], step=0.05）。必要なら範囲/刻みを調整。
-  - ECEは “max prob” によるビニング（通常の Expected Calibration Error）。信頼度のビン単位平均誤差を加重平均。
-  - registry へ "temperature_scaler" 名で登録（tensaku.registry を使用可能）。
+@module     tensaku.calibration
+@role       温度スケーリング（Temperature Scaling）と校正指標（NLL/ECE/信頼度ビン）
+@inputs     - logits: ndarray (N, C)        ※基本は logits 入力（Tスケーリングは logits / T）
+           - y:      ndarray (N,) int 0..C-1
+           - probs:  ndarray (N, C)（任意。可視化/外部計算に利用）
+@outputs    - TemperatureScaler.fit(logits, y) -> float（devで最良T）
+           - TemperatureScaler.transform_logits(logits) -> logits'
+           - nll_from_logits(logits, y, T=1.0) -> float
+           - ece(probs, y, n_bins=15) -> float
+           - reliability_bins(probs, y, n_bins=15) -> dict（binごとの count/accuracy/avg_conf）
+@cli        直接のCLIは持たない（tensaku gate / infer-pool等から内部利用）
+@api        class TemperatureScaler(T_min=0.5, T_max=3.0, step=0.05).fit(...).transform_logits(...)
+@deps       numpy（必須）
+@config     calibration: {enable: bool, T_min: float, T_max: float, step: float, n_bins: int=15}
+@contracts  - T は正の実数。logits shape=(N,C) と y shape=(N,) が整合
+           - 返すTは dev セットでのECE最小（同点は小さいT優先）
+@errors     - 形状不一致は ValueError、NaN/Infを検知した場合は RuntimeError を送出
+@notes      - ECEは “max prob” の標準定義。binsの端は[0,1]を等間隔に分割
+@tests      - スモーク: 乱数logitsとyで fit→T∈[0.5,3.0] を確認、reliability_binsの総数=件数
 """
+
 
 from __future__ import annotations
 

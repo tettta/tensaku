@@ -13,6 +13,7 @@ dependencies = [
   "numpy",
   "matplotlib",
   "pyyaml",
+  "seaborn>=0.13.2",
 ]
 
 [project.scripts]

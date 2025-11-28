@@ -1,21 +1,25 @@
 # /home/esakit25/work/tensaku/src/tensaku/confidence.py
 """
-@module: tensaku.confidence
-@role: Confidence estimators (MSP / entropy / energy / margin / MC-Dropout) with a lightweight registry hook.
-@inputs:
-  - logits: ndarray | torch.Tensor, shape (N, C)  ※一部推定器（MC-Dropout）は model & dataloader を直接受け取るユーティリティを提供
-  - probs:  ndarray | torch.Tensor, shape (N, C)  ※logits があれば内部で softmax(T) を適用
-  - temperature (T): float, optional       ※温度スケーリング後の信頼度算出に利用
-@outputs:
-  - conf: ndarray, shape (N,)  各サンプルの信頼度（大きいほど確信が高い想定）
-@cli: （直接のCLIは持たない。tensaku gate / tensaku infer-pool から内部利用）
-@notes:
-  - すべて **純関数的** に扱える logits/probs ベースの推定器と、**再推論を伴う** MC-Dropout を同一レイヤに整理。
-  - 出力スケールは以下を原則とする：
-      MSP, 1-Entropy(norm), Energy(sigmoid), Margin(sigmoid) は **[0,1]** に正規化（単調変換）。
-    ※ Energy と Margin はランク保存を優先し、単調写像（sigmoid）で 0–1 に収める。
-  - registry への登録名： "msp", "entropy", "energy", "margin", "mc_dropout"
+@module     tensaku.confidence
+@role       確信度推定（MSP / entropy / energy / margin / MC-Dropout）の薄い共通層
+@inputs     - logits: ndarray | torch.Tensor, shape (N, C)  ※logitsがあれば内部でsoftmax(T)適用可
+           - probs:  ndarray | torch.Tensor, shape (N, C)  ※logits無しでも可
+           - temperature (T): float（任意。温度スケーリング後の確信度に使用）
+           - MC-Dropout系: model, dataloader（再推論）
+@outputs    - conf: ndarray, shape (N,)（大きいほど確信が高い想定）
+@cli        直接のCLIは持たない（tensaku gate / tensaku infer-pool から内部利用）
+@api        create_estimator(name:str, **kw) -> Callable[..., np.ndarray]
+           提供名: "msp", "entropy", "energy", "margin", "mc_dropdown"
+@deps       numpy（必須） / torch（任意。MC-Dropout時）
+@config     CFG.gate.conf_name でレジストリ（tensaku.registry）から name を解決
+@contracts  - 返値は [0,1] 正規化（MSP, 1-Entropy(normalized), Energy(sigmoid), Margin(sigmoid)）
+           - 入力 logits/probs は (N,C)。C>=2。NaN/Infは非許容
+@errors     - 未対応nameは KeyError。型/形状不整合は ValueError（メッセージにnameとshapeを含める）
+@notes      - Energy/Marginはランク保持を優先し単調写像(sigmoid)で0–1に収める
+           - registry への登録名: "msp", "entropy", "energy", "margin", "mc_dropout"
+@tests      - スモーク: ランダムlogits→各推定器の先頭3件を出力（範囲[0,1]にあることをassert）
 """
+
 
 from __future__ import annotations
 
@@ -176,10 +180,12 @@ class Energy(ConfidenceEstimator):
             logits_np = np.log(np.clip(p, 1e-12, 1.0))
         else:
             logits_np = _to_numpy(logits) / max(temperature, 1e-8)
+
         lse = _logsumexp_np(logits_np)  # logsumexp
         energy = -lse
-        # スケール不変な単調変換で 0..1 に：
-        return _sigmoid01(energy)
+        # ここで σ(-E) を返す（E が小さいほど conf が大きくなるように反転）
+        return _sigmoid01(-energy)
+
 
 
 # ---- Margin (top1 - top2) ------------------------------------------------------------------------
@@ -350,3 +356,234 @@ if __name__ == "__main__":  # 簡易動作確認（ユニットテストの代�
     print("[entropy]", OneMinusEntropy()(logits=logits)[:3])
     print("[energy]", Energy()(logits=logits)[:3])
     print("[margin]", Margin(alpha=8.0)(logits=logits)[:3])
+
+
+# ---- CLI entry point: tensaku confidence --------------------------------------------
+
+
+def run(argv=None, cfg=None) -> int:
+    """
+    @cli   : tensaku confidence -c CFG.yaml [--out PATH]
+    @role  : dev/pool/test の *_preds.csv から preds_detail.csv を生成し、
+             Active Learning / 可視化用に一貫したカラム構成へ正規化しつつ、
+             必要に応じて logits.npy から追加の確信度指標を計算して付与する。
+    """
+    import argparse
+    import math as _math
+    import os as _os
+    import pandas as _pd
+    import numpy as _np
+
+    parser = argparse.ArgumentParser(prog="tensaku confidence", add_help=True)
+    parser.add_argument(
+        "--out",
+        "--detail-out",
+        dest="out_path",
+        default=None,
+        help="書き出す preds_detail.csv のパス（省略時: {run.out_dir}/preds_detail.csv）",
+    )
+    args = parser.parse_args(argv or [])
+
+    # ---- 設定読み出し -------------------------------------------------
+    cfg = cfg or {}
+    run_cfg = cfg.get("run", {}) or {}
+    conf_cfg = cfg.get("confidence", {}) or {}
+    out_dir = run_cfg.get("out_dir")
+    if not out_dir:
+        print("[confidence] ERROR: run.out_dir is not set in config", flush=True)
+        return 1
+    out_dir = str(out_dir)
+
+    # estimators: [{name: "msp"}, "entropy", ...] などを許容
+    raw_ests = conf_cfg.get("estimators", []) or []
+    est_names: list[str] = []
+    for est in raw_ests:
+        if isinstance(est, dict):
+            name = est.get("name")
+        else:
+            name = str(est)
+        if not name:
+            continue
+        est_names.append(str(name).strip())
+    # 小文字で正規化
+    est_names = [n.lower() for n in est_names]
+
+    # ---- splitごとの preds.csv 読み込み --------------------------------
+    def _load_split(split_name: str) -> "_pd.DataFrame | None":
+        path = _os.path.join(out_dir, f"{split_name}_preds.csv")
+        if not _os.path.exists(path):
+            print(f"[confidence] WARN: missing preds CSV for split='{split_name}': {path}", flush=True)
+            return None
+        df = _pd.read_csv(path)
+        if "id" not in df.columns:
+            raise KeyError(f"[confidence] missing 'id' column in {path}")
+        df.insert(0, "split", split_name)
+
+        # y_true は pool では存在しないので NaN で埋める
+        if "y_true" not in df.columns:
+            df["y_true"] = _np.nan
+
+        # conf_msp は必須（infer-pool 側で出力されている前提）
+        if "conf_msp" not in df.columns:
+            raise KeyError(f"[confidence] missing 'conf_msp' column in {path}")
+
+        return df
+
+    dfs = []
+    for split_name in ("dev", "pool", "test"):
+        df = _load_split(split_name)
+        if df is not None:
+            dfs.append(df)
+
+    if not dfs:
+        print("[confidence] ERROR: no preds CSV found in out_dir", flush=True)
+        return 1
+
+    df_all = _pd.concat(dfs, ignore_index=True)
+
+    # ---- logits ベースの追加確信度指標を計算 ----------------------------
+    # estimator名 → 出力カラム名のマッピング
+    est_to_col = {
+        "msp": "conf_msp",
+        "entropy": "conf_entropy",
+        "energy": "conf_energy",
+        "margin": "conf_margin",
+        "prob_margin": "conf_prob_margin",
+        "mc_dropout": "conf_mcdo",
+        "trust": "conf_trust",
+        "conf_trust": "conf_trust",
+    }
+
+    # logits が必要な推定器
+    need_logits = {"msp", "entropy", "energy", "margin", "prob_margin", "mc_dropout"}
+
+    # splitごとの logits をキャッシュ読み込み
+    logits_cache: dict[str, "_np.ndarray | None"] = {}
+
+    def _load_logits(split_name: str) -> "_np.ndarray | None":
+        if split_name in logits_cache:
+            return logits_cache[split_name]
+        path = _os.path.join(out_dir, f"{split_name}_logits.npy")
+        if not _os.path.exists(path):
+            print(f"[confidence] WARN: missing logits for split='{split_name}': {path}", flush=True)
+            logits_cache[split_name] = None
+            return None
+        arr = _np.load(path)
+        logits_cache[split_name] = arr
+        return arr
+
+    # 実際に計算
+    splits_present = list(dict.fromkeys(df_all["split"].tolist()))  # 順序保持のunique
+
+    for est_name in est_names:
+        col = est_to_col.get(est_name)
+        if not col:
+            print(f"[confidence] WARN: unknown estimator name in config: {est_name}", flush=True)
+            continue
+
+        # 既にカラムがある場合は再計算しない（infer-pool等で埋まっているケース）
+        if col in df_all.columns:
+            continue
+
+        # trust/conf_trust は infer-pool 側で算出済みの列を期待
+        if est_name in {"trust", "conf_trust"}:
+            if "conf_trust" not in df_all.columns:
+                print("[confidence] WARN: 'conf_trust' column is not present; skipping trust estimator", flush=True)
+            continue
+
+        # msp は conf_msp 列が既にある前提なので、ここでは何もしない
+        if est_name == "msp":
+            continue
+
+        # MC-Dropout は現状 CLI からの on-demand 再推論には未対応（将来拡張）
+        if est_name == "mc_dropout":
+            print("[confidence] WARN: 'mc_dropout' estimator is not yet supported in CLI; skipping.", flush=True)
+            continue
+
+        # ここからは logits 必須の推定器（entropy / energy / margin / prob_margin）
+        if est_name in need_logits:
+            # estimator インスタンスを作成
+            try:
+                est = create_estimator(est_name)
+            except Exception as e:  # pragma: no cover - best effort
+                print(f"[confidence] WARN: failed to create estimator '{est_name}': {e}; skip", flush=True)
+                continue
+
+            # カラムを先に作っておく（デフォルト NaN）
+            df_all[col] = _np.nan
+
+            for split_name in splits_present:
+                mask = df_all["split"] == split_name
+                if not mask.any():
+                    continue
+                logits = _load_logits(split_name)
+                if logits is None:
+                    # この split では計算できないので NaN のまま
+                    continue
+                n_rows = int(mask.sum())
+                if logits.shape[0] != n_rows:
+                    print(
+                        f"[confidence] WARN: logits length mismatch for split='{split_name}' "
+                        f"(csv_rows={n_rows}, logits_rows={logits.shape[0]}); skipping this split.",
+                        flush=True,
+                    )
+                    continue
+                try:
+                    conf = est(logits=logits)
+                except Exception as e:  # pragma: no cover - best effort
+                    print(
+                        f"[confidence] WARN: estimator '{est_name}' failed on split='{split_name}': {e}; skip this split.",
+                        flush=True,
+                    )
+                    continue
+                conf = _np.asarray(conf).reshape(-1)
+                if conf.shape[0] != n_rows:
+                    print(
+                        f"[confidence] WARN: estimator '{est_name}' returned length {conf.shape[0]} "
+                        f"for split='{split_name}' (expected {n_rows}); skipping this split.",
+                        flush=True,
+                    )
+                    continue
+                df_all.loc[mask, col] = conf
+
+    # ---- カラム順を固定（AL / viz / gate で前提とする） ----------------
+    base_cols = [
+        "split",
+        "id",
+        "y_true",
+        "y_pred",
+        "conf_msp",
+        "conf_msp_temp",
+        "conf_trust",
+        "conf_entropy",
+        "conf_margin",
+        "conf_prob_margin",
+        "conf_energy",
+        "conf_mcdo",
+    ]
+    other_cols = [c for c in df_all.columns if c not in base_cols]
+    ordered_cols = [c for c in base_cols if c in df_all.columns] + other_cols
+    df_all = df_all[ordered_cols]
+
+    # ---- preds_detail.csv として保存 ------------------------------------
+    out_path = args.out_path or _os.path.join(out_dir, "preds_detail.csv")
+    _os.makedirs(_os.path.dirname(out_path), exist_ok=True)
+    df_all.to_csv(out_path, index=False)
+    print(f"[confidence] wrote preds_detail.csv -> {out_path} (n={len(df_all)})", flush=True)
+
+    # ついでに dev 行の簡易指標もログに出す（研究メモ用）
+    dev_mask = df_all["split"] == "dev"
+    if dev_mask.any():
+        dev = df_all[dev_mask]
+        try:
+            y_true = dev["y_true"].to_numpy(dtype=float)
+            y_pred = dev["y_pred"].to_numpy(dtype=float)
+            err = y_pred - y_true
+            rmse = float(_math.sqrt(_np.mean(err ** 2)))
+            cse = float(_np.mean(_np.abs(err) >= 2.0))
+            print(f"[confidence] dev summary: RMSE={rmse:.4f}, CSE(|err|>=2)={cse:.4f}", flush=True)
+        except Exception as e:  # pragma: no cover - best effort
+            print(f"[confidence] WARN: failed to compute dev summary metrics: {e}", flush=True)
+
+    return 0
+
