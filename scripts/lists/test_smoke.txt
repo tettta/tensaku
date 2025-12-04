@@ -1,1 +1,3 @@
-test_smoke msp random
+# NAME              AL_BY     AL_SAMPLER
+test_smoke_rand     msp       random
+test_smoke_hybrid   trust     hybrid

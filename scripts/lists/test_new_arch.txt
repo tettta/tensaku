@@ -1,0 +1,3 @@
+# NAME              AL_BY     AL_SAMPLER
+test_new_rand       msp       random
+test_new_hybrid     trust     hybrid

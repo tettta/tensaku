@@ -1,6 +1,13 @@
-# NAME              AL_BY     AL_SAMPLER
-#exp_al_random       msp       random
-#exp_al_msp          msp       uncertainty
-#exp_al_entropy      entropy   uncertainty
-#exp_al_trust        trust     uncertainty
-exp_al_hybrid       trust     hybrid
+# scripts/lists/experiments.txt
+
+# 1. Baseline
+exp_al_random       none       random
+
+# 2. Uncertainty Sampling
+exp_al_msp          msp       uncertainty
+exp_al_entropy      entropy   uncertainty
+exp_al_trust        trust     uncertainty
+
+# 3. Diversity / Hybrid
+exp_al_clustering   none       clustering  # 純粋な多様性 (K-Meansのみ)
+exp_al_hybrid       trust     hybrid      # 不確実性(Trust) + 多様性(K-Means)

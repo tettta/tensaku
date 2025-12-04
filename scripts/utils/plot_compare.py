@@ -1,4 +1,4 @@
-# scripts/utils/plot_al_curves.py
+# scripts/utils/plot_al_compare.py
 # -*- coding: utf-8 -*-
 """
 @role: 実験結果を集計・比較描画する（メタデータ活用・集約機能・フォルダ自動整理付き）

@@ -75,7 +75,6 @@ COMMANDS: Dict[str, SubcommandFunc] = {
     "confidence":       _lazy_runner("confidence"),
     "gate":             _lazy_runner("gate"),
     "eval":             _lazy_runner("eval"),
-    "viz":              _lazy_runner("viz"),
     "al-sample":        _lazy_runner("al_sample"),
     "al_sample":        _lazy_runner("al_sample"),
     "al-label-import":  _lazy_runner("al_label_import"),

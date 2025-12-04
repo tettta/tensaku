@@ -1,0 +1,1 @@
+scripts/run_batch.sh: line 22: GLOBAL_LOG_DIR: unbound variable

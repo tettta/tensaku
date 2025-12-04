@@ -29,7 +29,7 @@ split:
     test: 0.15
   freeze_dev_test: true
   seed: 42
-  # n_train: 10 # Cold Start実験をする場合はここを有効化
+  #n_train: 10 # Cold Start実験をする場合はここを有効化
 
 model:
   name: cl-tohoku/bert-base-japanese-v3
@@ -41,7 +41,7 @@ model:
 train:
   epochs: 5       # AL用に短縮
   batch_size: 16  # 安定性重視
-  lr_full: 3.0e-05
+  lr_full: 2.0e-05
   lr_frozen: 0.0005
   early_stop_metric: null
 
@@ -105,6 +105,7 @@ hitl:
 al:
   rounds: 10          # デフォルトのラウンド数
   budget: 50          # 1ラウンドあたりの追加数
+  start_size: 50      # 初期ラベル付きデータ数
   seed: 42
   
   sampler:

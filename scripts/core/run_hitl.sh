@@ -6,7 +6,6 @@ set -euo pipefail
 # HITL 一連パイプライン実行スクリプト
 # =============================================================================
 
-# 深さが変わったので ../..
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 CFG_REL="${CFG:-configs/exp_al_hitl.yaml}"
 
@@ -51,9 +50,8 @@ echo "[hitl.sh] OUT =${OUT_DIR}"
 
 COMMON_SET_ARGS=(--set "run.data_dir=${DATA_DIR}" --set "run.out_dir=${OUT_DIR}")
 
-# 【追加】CFG_OVERRIDE があれば COMMON_SET_ARGS に結合
+# CFG_OVERRIDE があれば結合
 if [[ -n "${CFG_OVERRIDE:-}" ]]; then
-  # スペース区切りで分割して配列に追加
   read -ra OVERRIDE_ARR <<< "${CFG_OVERRIDE}"
   COMMON_SET_ARGS+=("${OVERRIDE_ARR[@]}")
 fi
@@ -84,18 +82,16 @@ tensaku infer-pool -c "${CFG_ABS}" --trust "${COMMON_SET_ARGS[@]}" \
 echo "[hitl.sh] STEP 3: confidence"
 tensaku confidence -c "${CFG_ABS}" "${COMMON_SET_ARGS[@]}"
 
-echo "[hitl.sh] STEP 4: viz"
-tensaku viz -c "${CFG_ABS}" "${COMMON_SET_ARGS[@]}" || echo "[hitl.sh] WARN: viz failed, continuing..."
 
-echo "[hitl.sh] STEP 5: gate"
+echo "[hitl.sh] STEP 4: gate"
 tensaku gate -c "${CFG_ABS}" --conf-key conf_trust "${COMMON_SET_ARGS[@]}"
 
-echo "[hitl.sh] STEP 6: hitl-report"
-tensaku hitl-report -c "${CFG_ABS}" "${COMMON_SET_ARGS[@]}"
-
-# scripts/core/hitl.sh の末尾部分
-
-# ... (前略)
+echo "[hitl.sh] STEP 5: hitl-report"
+REPORT_ARGS=("${COMMON_SET_ARGS[@]}")
+if [[ -n "${AL_N_LABELED:-}" ]]; then
+  REPORT_ARGS+=(--n-labeled "${AL_N_LABELED}")
+fi
+tensaku hitl-report -c "${CFG_ABS}" "${REPORT_ARGS[@]}"
 
 # --- 4. Rename Summary ---
 if [[ "${AL_ROUND_IDX}" != "" ]]; then
@@ -108,13 +104,11 @@ if [[ "${AL_ROUND_IDX}" != "" ]]; then
     echo "[hitl.sh] Renamed summary: $(basename "${SUMMARY_CSV}") -> $(basename "${NEW_CSV}")"
   fi
   
-  # 【修正ポイント】ファイル存在確認を追加
   if [[ -f "${SUMMARY_JSON}" ]]; then
     NEW_JSON="${OUT_DIR}/hitl_summary_round${AL_ROUND_IDX}.json"
     mv "${SUMMARY_JSON}" "${NEW_JSON}"
     echo "[hitl.sh] Renamed json: $(basename "${SUMMARY_JSON}") -> $(basename "${NEW_JSON}")"
   else
-    # ファイルがなくてもエラーにせず、警告だけ出して進む
     echo "[hitl.sh] WARN: hitl_summary.json not found (skipping rename)."
   fi
 fi
