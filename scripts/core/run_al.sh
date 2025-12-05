@@ -11,16 +11,33 @@ CFG="${CFG:-${ROOT}/configs/exp_al_hitl.yaml}"
 
 # --- 設定読み込み (Python連携) ---
 PY_OUT="$(python - <<'PY' "${CFG}"
-import sys, yaml, os
+import sys, yaml, os, typing as t
+
+def get_str(cfg: t.Mapping, path: t.Sequence[str]) -> str:
+    cur: t.Any = cfg
+    for key in path:
+        if not isinstance(cur, dict):
+            return ""
+        cur = cur.get(key)
+        if cur is None:
+            return ""
+    try:
+        return str(cur).strip()
+    except Exception:
+        return str(cur)
+
 try:
-    with open(sys.argv[1], "r") as f: c = yaml.safe_load(f) or {}
-    print(c.get("run", {}).get("out_dir", "").strip())
-    print(c.get("run", {}).get("data_dir", "").strip())
-    print(c.get("data", {}).get("qid", "").strip())
-    print(c.get("al", {}).get("rounds", "").strip())
-    print(c.get("al", {}).get("budget", "").strip())
-    print(c.get("al", {}).get("start_size", "").strip())
-except: pass
+    with open(sys.argv[1], "r") as f:
+        c = yaml.safe_load(f) or {}
+except Exception:
+    c = {}
+
+print(get_str(c, ("run", "out_dir")))
+print(get_str(c, ("run", "data_dir")))
+print(get_str(c, ("data", "qid")))
+print(get_str(c, ("al", "rounds")))
+print(get_str(c, ("al", "budget")))
+print(get_str(c, ("al", "start_size")))
 PY
 )"
 YAML_OUT="$(echo "${PY_OUT}" | sed -n '1p')"
@@ -53,10 +70,10 @@ TIME_FILE="${OUT_DIR}/time.txt"
 
 AL_BY="${AL_BY:-trust}"
 AL_SAMPLER="${AL_SAMPLER:-uncertainty}"
-AL_ASC="${AL_ASC:-}" 
+AL_ASC="${AL_ASC:-}"
 AL_CLEAN_CKPT_AFTER="${AL_CLEAN_CKPT_AFTER:-0}"
 
-# ★変更点: run_id を QID_実験名 の形式で生成 ★
+# ★ run_id を QID_実験名 の形式で生成 ★
 EXP_NAME=$(basename "${OUT_DIR}")
 RUN_ID="${QID}_${EXP_NAME}"
 echo "[run_al] RUN_ID set to: ${RUN_ID}"
@@ -98,7 +115,15 @@ if [[ "${MISSING_FILES}" -eq 1 ]]; then
   fi
   if [[ -f "${INPUT_ALL}" ]]; then
     echo "[run_al] Found master data: ${INPUT_ALL}"
-    tensaku split -c "${CFG}" "${COMMON_ARGS[@]}" --set "data.input_all=${INPUT_ALL}" --n-train "${START_SIZE}"
+    SPLIT_ARGS=(
+      split -c "${CFG}"
+      "${COMMON_ARGS[@]}"
+      --set "data.input_all=${INPUT_ALL}"
+    )
+    if [[ -n "${START_SIZE}" ]]; then
+      SPLIT_ARGS+=(--n-train "${START_SIZE}")
+    fi
+    tensaku "${SPLIT_ARGS[@]}"
   else
     echo "[run_al] ERROR: Data files missing and 'all.jsonl' not found."
     exit 1
@@ -125,7 +150,7 @@ fi
   HISTORY_FILE="${OUT_DIR}/al_history.csv"
 
   if [[ "${AL_RESUME:-0}" == "1" && -f "${HISTORY_FILE}" ]]; then
-      LAST_R=$(python -c "import csv,sys; r=[int(d['round']) for d in csv.DictReader(open('${HISTORY_FILE}')) if d['round'].isdigit()] or [-1]; print(max(r))")
+      LAST_R=$(python -c "import csv,sys; r=[int(d['round']) for d in csv.DictReader(open(sys.argv[1])) if d['round'].isdigit()] or [-1]; print(max(r))" "${HISTORY_FILE}")
       if [[ "${LAST_R}" != "-1" ]]; then
           start_round=$((LAST_R + 1))
           echo "[run_al] 🔄 Resuming from Round ${start_round}..."
@@ -135,7 +160,7 @@ fi
 
   # --- ラウンドループ ---
   while [[ "${round}" -lt "${ROUNDS}" ]]; do
-  
+
     # 各ラウンド開始時に時刻を記録
     echo ""
     echo "--------------------------------------------------------------------------"
@@ -147,12 +172,12 @@ fi
       echo "[run_al] Pool is empty. Stopping AL loop gracefully."
       break
     fi
-    
+
     N_LABELED=0
     if [[ -f "${DATA_DIR}/labeled.jsonl" ]]; then
         N_LABELED=$(grep -c . "${DATA_DIR}/labeled.jsonl" || echo 0)
     fi
-    
+
     # HITL実行 (学習・推論)
     CFG="${CFG}" QID="${QID}" DATA_DIR="${DATA_DIR}" OUT_DIR="${OUT_DIR}" \
     AL_ROUND_IDX="${round}" CFG_OVERRIDE="${CFG_OVERRIDE:-}" \
@@ -162,9 +187,9 @@ fi
     # サンプリング
     SAMPLE_CMD=(tensaku al-sample -c "${CFG}" "${COMMON_ARGS[@]}" --budget "${BUDGET}" --uncertainty "${AL_BY}")
     if [[ -n "${AL_SAMPLER}" ]]; then SAMPLE_CMD+=(--sampler "${AL_SAMPLER}"); fi
-    if [[ "${AL_ASC}" == "1" ]]; then SAMPLE_CMD+=(--ascending); 
+    if [[ "${AL_ASC}" == "1" ]]; then SAMPLE_CMD+=(--ascending);
     elif [[ "${AL_ASC}" == "0" ]]; then SAMPLE_CMD+=(--descending); fi
-    
+
     echo "[run_al] Running sampler..."
     "${SAMPLE_CMD[@]}"
 
@@ -212,7 +237,7 @@ PY
     rm -rf -- "${CKPT_DIR}"
     echo "[run_al] Checkpoints cleaned."
   fi
-  
+
   # 全体の所要時間計算と記録 (time.txt)
   END_TIME_SEC=$(date +%s)
   DURATION=$((END_TIME_SEC - START_TIME_SEC))

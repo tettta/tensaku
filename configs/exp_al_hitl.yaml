@@ -1,7 +1,7 @@
 # /home/esakit25/work/tensaku/configs/exp_al_hitl.yaml
 
 run:
-  run_id: R1
+  run_id: experiment_qid
   seed: 42
   # out_dir, data_dir は al.sh で環境変数 QID/OUT_DIR/DATA_DIR から上書きされる前提
   out_dir: /home/esakit25/work/tensaku/outputs/q-Y14_1-2_1_3
@@ -19,17 +19,18 @@ data:
   text_key_fallback: text
   label_key: score
   id_key: id
-  max_len: 96 # 高速化のため短縮
+  max_len: 128 # 高速化のため短縮
 
 split:
   enable: false
-  ratios:
-    train: 0.7
-    dev: 0.15
+  ratio:
     test: 0.15
+    dev: 0.15
+    #labeled: 0.2
+    #pool: 0.5
   freeze_dev_test: true
   seed: 42
-  #n_train: 10 # Cold Start実験をする場合はここを有効化
+  n_train: 50
 
 model:
   name: cl-tohoku/bert-base-japanese-v3
@@ -39,11 +40,12 @@ model:
   ckpt: null # 自動解決のためnull
 
 train:
-  epochs: 5       # AL用に短縮
+  epochs: 20
   batch_size: 16  # 安定性重視
   lr_full: 2.0e-05
   lr_frozen: 0.0005
-  early_stop_metric: null
+  early_stop_metric: "valid/loss"
+  patience: 3
 
 infer:
   ckpt: null
@@ -103,9 +105,9 @@ hitl:
 
 # === 追加した AL セクション ===
 al:
-  rounds: 10          # デフォルトのラウンド数
+  rounds: 30          # デフォルトのラウンド数
   budget: 50          # 1ラウンドあたりの追加数
-  start_size: 50      # 初期ラベル付きデータ数
+  #start_size: 50      # 初期ラベル付きデータ数
   seed: 42
   
   sampler:

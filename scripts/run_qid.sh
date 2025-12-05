@@ -18,10 +18,17 @@ cd "${ROOT}"
 
 echo "[run_qid] QID        = ${QID:-'(Auto/YAML)'}"
 echo "[run_qid] ROUNDS     = ${ROUNDS:-'(Auto/YAML)'}"
-echo "[run_qid] K          = ${BUDGET:-'(Auto/YAML)'}"
+echo "[run_qid] BUDGET     = ${BUDGET:-'(Auto/YAML)'}"
 echo "[run_qid] START_SIZE = ${START_SIZE:-'(Auto/YAML)'}"
 echo "[run_qid] LIST       = ${EXPERIMENTS_FILE}"
+echo "------------------------------------------------------------"
 
+if [[ -z "${QID}" ]]; then
+  echo "ERROR: QID is not set."
+  exit 1
+fi
+
+# master all.jsonl の候補
 INPUT_ALL="${ROOT}/data_sas/all.jsonl"
 if [[ ! -f "${INPUT_ALL}" ]]; then INPUT_ALL="${ROOT}/data_sas/q-${QID}/all.jsonl"; fi
 
@@ -38,11 +45,22 @@ if [[ -d "${BASE_SPLIT_DIR}" ]]; then rm -rf "${BASE_SPLIT_DIR}"; fi
 mkdir -p "${BASE_SPLIT_DIR}"
 
 echo "------------------------------------------------------------"
-echo "[run_qid] Creating Base Split (n_train=${START_SIZE})..."
+echo "[run_qid] Creating Base Split (n_train=${START_SIZE:-'(Auto/YAML)'})..."
 echo "------------------------------------------------------------"
-tensaku split -c "${FIRST_CFG}" \
-  --set "data.qid=${QID}" --set "run.data_dir=${BASE_SPLIT_DIR}" --set "data.input_all=${INPUT_ALL}" \
-  --n-train "${START_SIZE}"
+
+SPLIT_ARGS=(
+  split -c "${FIRST_CFG}"
+  --set "data.qid=${QID}"
+  --set "run.data_dir=${BASE_SPLIT_DIR}"
+  --set "data.input_all=${INPUT_ALL}"
+)
+
+if [[ -n "${START_SIZE}" ]]; then
+  SPLIT_ARGS+=(--set "split.n_train=${START_SIZE}")
+fi
+
+tensaku "${SPLIT_ARGS[@]}"
+
 
 CFG_OVERRIDE_GLOBAL="${CFG_OVERRIDE:-}"
 if [[ -n "${CFG_OVERRIDE_GLOBAL}" ]]; then
