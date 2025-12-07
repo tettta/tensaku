@@ -2,7 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 @module     : tensaku.train
-@role       : 分類モデルの学習実行（Early Stopping / トークン統計 / モデル分離 対応版）
+@role       : 分類モデルの学習実行（I/O 分離・統合版）
+@overview   :
+    - train_core: DatasetSplit (メモリ上データ) を受け取り、学習を実行するコアロジック
+    - run       : CLI 用ラッパー。JSONL ファイルを読み込み train_core を呼ぶ
 """
 
 from __future__ import annotations
@@ -12,7 +15,8 @@ import os
 import json
 import random
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import numpy as np
 import torch
@@ -22,7 +26,9 @@ from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from sklearn.metrics import cohen_kappa_score
 
-# ★新規作成した models.py をインポート
+# Phase2 連携用
+from tensaku.data.base import DatasetSplit
+# モデル定義 (Phase2)
 from tensaku.models import create_model, create_tokenizer
 
 
@@ -93,27 +99,16 @@ def _normalize_labels(
     if bad > 0:
         print(f"[train] warn: skipped {bad} rows in {split_name} due to invalid '{label_key}'")
 
-    if min_y is not None and max_y is not None:
-        print(
-            f"[train] {split_name}: n={len(clean)}  "
-            f"{label_key}_min={min_y}  {label_key}_max={max_y}"
-        )
-    else:
-        print(f"[train] ERROR: no valid labels in {split_name} (key='{label_key}')")
-
     return clean, min_y, max_y
 
 
 def _analyze_token_lengths(rows: List[Dict[str, Any]], tok, text_key: str, split_name: str):
-    """★追加: データセットのトークン長統計を表示する"""
+    """データセットのトークン長統計を表示する"""
     lengths = []
-    # 高速化のため、データが多すぎる場合はサンプリングしても良いが、
-    # 今回は数千件程度想定なので全件チェックする
     for r in rows:
         text = r.get(text_key, "")
         if isinstance(text, list):
             text = " ".join(map(str, text))
-        # padding/truncationなしで実際の長さを計測
         ids = tok.encode(str(text), add_special_tokens=True)
         lengths.append(len(ids))
     
@@ -181,8 +176,11 @@ def _eval_qwk_rmse(model, loader: DataLoader, device: torch.device, n_class: int
                 batch[k] = v.to(device, non_blocking=True)
         logits = model(**{k: batch[k] for k in batch if k != "labels"}).logits
         pred = logits.argmax(-1).cpu().numpy()
-        ys.append(batch["labels"].numpy())
+        ys.append(batch["labels"].cpu().numpy())
         ps.append(pred)
+    
+    if not ys: return 0.0, 0.0
+    
     y = np.concatenate(ys)
     p = np.concatenate(ps)
     qwk = _qwk(y, p, n_class)
@@ -191,26 +189,26 @@ def _eval_qwk_rmse(model, loader: DataLoader, device: torch.device, n_class: int
 
 
 # =============================================================================
-# メイン
+# コアロジック (train_core)
 # =============================================================================
 
 
-def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
-    if cfg is None and isinstance(argv, dict):
-        cfg = argv
-        argv = []
-    if cfg is None:
-        raise ValueError("tensaku.train.run requires cfg dict")
+def train_core(
+    split: DatasetSplit,
+    out_dir: Path,
+    cfg: Mapping[str, Any],
+    meta: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    メモリ上のデータ (split) を用いて学習を実行するコア関数。
+    """
+    run_cfg = cfg.get("run", {})
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    train_cfg = cfg.get("train", {})
 
-    run_cfg = cfg["run"]
-    data_cfg = cfg["data"]
-    model_cfg = cfg["model"]
-    train_cfg = cfg["train"]
-
-    data_dir = run_cfg.get("data_dir")
-    files = data_cfg.get("files") or {}
-
-    meta = _load_meta_if_exists(data_dir)
+    # out_dir の確保
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     text_key = data_cfg.get("text_key_primary", "mecab")
     label_key = data_cfg.get("label_key", "score")
@@ -221,22 +219,24 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    fn_labeled = files.get("labeled") or files.get("train") or "labeled.jsonl"
-    path_tr = os.path.join(data_dir, fn_labeled)
-    path_dv = os.path.join(data_dir, files.get("dev", "dev.jsonl"))
+    # データの取得 (DatasetSplit -> List[Dict])
+    # train には labeled を使用する
+    rows_tr_raw = split.labeled
+    rows_dv_raw = split.dev
 
-    rows_tr_raw = _read_jsonl(path_tr)
-    rows_dv_raw = _read_jsonl(path_dv)
-
-    if not rows_tr_raw or not rows_dv_raw:
-        print(f"[train] ERROR: missing or empty data.", file=sys.stderr)
+    if not rows_tr_raw:
+        print(f"[train_core] ERROR: missing labeled data.")
         return 1
-
+    
+    # ラベル正規化
     rows_tr, min_tr, max_tr = _normalize_labels(rows_tr_raw, label_key, "train/labeled")
-    rows_dv, min_dv, max_dv = _normalize_labels(rows_dv_raw, label_key, "dev")
+    if rows_dv_raw:
+        rows_dv, min_dv, max_dv = _normalize_labels(rows_dv_raw, label_key, "dev")
+    else:
+        rows_dv, min_dv, max_dv = [], None, None
 
-    if not rows_tr or not rows_dv:
-        print("[train] ERROR: no usable data after label normalization.", file=sys.stderr)
+    if not rows_tr:
+        print("[train_core] ERROR: no valid training data.")
         return 1
 
     # クラス数決定ロジック
@@ -265,27 +265,16 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     if meta_num_labels is not None: n_class_candidates.append(meta_num_labels)
     if cfg_num_labels is not None: n_class_candidates.append(cfg_num_labels)
     n_class = max(n_class_candidates)
-
-    if cfg_num_labels and cfg_num_labels < n_class_data:
-        print(f"[train] WARN: cfg < data; using {n_class}")
     
-    bad_values = sorted({int(r[label_key]) for r in (rows_tr + rows_dv) if int(r[label_key]) < 0 or int(r[label_key]) >= n_class})
-    if bad_values:
-        print(f"[train] ERROR: label out of range: {bad_values[:10]}")
-        return 1
-
-    # ---- トークナイザ・モデル (models.py への委譲) ----
-    # ★変更点: create_tokenizer / create_model を使用
+    # トークナイザ・モデル構築 (models.py)
     tok = create_tokenizer(cfg)
     model = create_model(cfg, n_class)
 
-    # ▼▼▼ 追加機能: トークン長統計の表示 ▼▼▼
-    print(f"[train] Analyzing token lengths (max_len={max_len})...")
+    print(f"[train_core] Analyzing token lengths (max_len={max_len})...")
     _analyze_token_lengths(rows_tr, tok, text_key, "Train")
-    _analyze_token_lengths(rows_dv, tok, text_key, "Dev")
-    # ▲▲▲ 追加ここまで ▲▲▲
+    if rows_dv:
+        _analyze_token_lengths(rows_dv, tok, text_key, "Dev")
 
-    # Speed 設定は models.py で処理済みなのでここでは不要だが、Optimizerのパラメータグループ分けのために参照は必要
     speed = model_cfg.get("speed", "full")
 
     ds_tr = EssayDS(rows_tr, tok, text_key, label_key, max_len, with_label=True)
@@ -302,17 +291,10 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     if speed == "full":
         opt = AdamW(model.parameters(), lr=float(train_cfg.get("lr_full", 2e-5)))
     else:
-        # Frozen時、classifier層のみ学習
-        # ※ model.classifier が無いアーキテクチャへの対応が必要な場合は models.py 側で
-        #    パラメータグループを返すように拡張するのがベストだが、今回は簡易対応
-        if hasattr(model, "classifier"):
-            opt = AdamW(model.classifier.parameters(), lr=float(train_cfg.get("lr_frozen", 5e-4)))
-        elif hasattr(model, "fc"): # 一部のモデル対応
-            opt = AdamW(model.fc.parameters(), lr=float(train_cfg.get("lr_frozen", 5e-4)))
-        else:
-            # 万が一 classifier が見つからない場合は全パラメータを渡す（Freeze自体は models.py でされているので安全）
-            print("[train] WARN: specific classifier layer not found, using all params (gradients rely on requires_grad).")
-            opt = AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=float(train_cfg.get("lr_frozen", 5e-4)))
+        # Frozen or FE_sklearn (model.freeze_base=True は models.py で処理済み)
+        # requires_grad=True のパラメータのみ Optimizer に渡す
+        params = filter(lambda p: p.requires_grad, model.parameters())
+        opt = AdamW(params, lr=float(train_cfg.get("lr_frozen", 5e-4)))
 
     epochs = int(train_cfg.get("epochs", 5))
     total_steps = epochs * max(1, math.ceil(len(ds_tr) / bs))
@@ -320,27 +302,22 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
         opt, num_warmup_steps=0, num_training_steps=total_steps
     )
 
-    out_root = run_cfg.get("out_dir", "./outputs")
-    ckpt_dir = os.path.join(out_root, "checkpoints_min")
-    os.makedirs(ckpt_dir, exist_ok=True)
+    ckpt_dir = out_dir / "checkpoints_min"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     
     best_qwk = -1.0
-    
-    # ▼▼▼ 追加機能: Early Stopping の設定 ▼▼▼
-    patience = int(train_cfg.get("patience", -1)) # デフォルトは無効(-1)
+    patience = int(train_cfg.get("patience", -1))
     no_improve_cnt = 0
     if patience > 0:
-        print(f"[train] Early Stopping ENABLED: patience={patience}")
-    # ▲▲▲ 追加ここまで ▲▲▲
+        print(f"[train_core] Early Stopping ENABLED: patience={patience}")
 
     AMP_ENABLED = device.type == "cuda"
     AMP_DTYPE = torch.bfloat16
     scaler = GradScaler(enabled=AMP_ENABLED)
 
     print(
-        f"[train] data_dir={data_dir}  out_dir={out_root} "
-        f"n_class={n_class}  speed={speed}  device={device.type}  "
-        f"epochs={epochs}  batch_size={bs}  max_len={max_len}"
+        f"[train_core] out_dir={out_dir} n_class={n_class} speed={speed} "
+        f"device={device.type} epochs={epochs} batch_size={bs} max_len={max_len}"
     )
 
     for ep in range(1, epochs + 1):
@@ -360,34 +337,94 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
             scaler.update()
             sched.step()
 
-        qwk, rmse = _eval_qwk_rmse(model, dl_dv, device, n_class)
-        print(f"[train] epoch {ep}/{epochs}  dev: QWK={qwk:.4f}  RMSE={rmse:.4f}")
-        
-        # 最終エポック保存
-        torch.save(
-            {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-            os.path.join(ckpt_dir, "last.pt"),
-        )
-        
-        # ベスト更新判定
-        if qwk > best_qwk:
-            best_qwk = qwk
-            no_improve_cnt = 0
+        # Validation
+        if rows_dv:
+            qwk, rmse = _eval_qwk_rmse(model, dl_dv, device, n_class)
+            print(f"[train_core] Epoch {ep}/{epochs}: Dev QWK={qwk:.4f}, RMSE={rmse:.4f}")
+            
+            # Save Last
             torch.save(
                 {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-                os.path.join(ckpt_dir, "best.pt"),
+                ckpt_dir / "last.pt",
             )
+            
+            # Save Best & Early Stopping
+            if qwk > best_qwk:
+                best_qwk = qwk
+                no_improve_cnt = 0
+                torch.save(
+                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
+                    ckpt_dir / "best.pt",
+                )
+            else:
+                if patience > 0:
+                    no_improve_cnt += 1
+                    if no_improve_cnt >= patience:
+                        print(f"[train_core] Early stopping triggered at epoch {ep}")
+                        break
         else:
-            # Early Stopping 判定
-            if patience > 0:
-                no_improve_cnt += 1
-                if no_improve_cnt >= patience:
-                    print(f"[train] Early stopping triggered at epoch {ep} (no improve for {patience} epochs)")
-                    break
+            print(f"[train_core] Epoch {ep}/{epochs}: (No dev data)")
+            torch.save(
+                {"model": model.state_dict(), "epoch": ep, "n_class": n_class},
+                ckpt_dir / "best.pt",
+            )
 
-    print(f"[train] done. best QWK={best_qwk:.4f}  ckpt={ckpt_dir}/best.pt")
+    print(f"[train_core] Training finished. Best QWK={best_qwk:.4f}")
     return 0
 
 
+# =============================================================================
+# CLI エントリポイント (run)
+# =============================================================================
+
+
+def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
+    """
+    CLI 用ラッパー。
+    Config からパスを解決し、JSONL を読み込んで DatasetSplit を構築し、train_core を呼ぶ。
+    """
+    if cfg is None and isinstance(argv, dict):
+        cfg = argv
+        argv = []
+    if cfg is None:
+        raise ValueError("tensaku.train.run requires cfg dict")
+
+    run_cfg = cfg.get("run", {})
+    data_cfg = cfg.get("data", {})
+    
+    data_dir = run_cfg.get("data_dir")
+    if not data_dir:
+        print("[train] ERROR: run.data_dir is not set.")
+        return 1
+
+    files = data_cfg.get("files") or {}
+    fn_labeled = files.get("labeled") or files.get("train") or "labeled.jsonl"
+    path_tr = os.path.join(data_dir, fn_labeled)
+    path_dv = os.path.join(data_dir, files.get("dev", "dev.jsonl"))
+
+    rows_tr = _read_jsonl(path_tr)
+    rows_dv = _read_jsonl(path_dv)
+
+    if not rows_tr:
+        print(f"[train] ERROR: failed to load labeled data from {path_tr}")
+        return 1
+    # dev は空でも許容 (train_core 側でハンドリング)
+
+    meta = _load_meta_if_exists(data_dir)
+
+    split = DatasetSplit(
+        labeled=rows_tr,
+        dev=rows_dv,
+        test=[],
+        pool=[]
+    )
+
+    out_dir_str = run_cfg.get("out_dir", "./outputs")
+    out_dir = Path(out_dir_str)
+
+    # コアロジックへ委譲
+    return train_core(split=split, out_dir=out_dir, cfg=cfg, meta=meta)
+
+
 if __name__ == "__main__":
-    print("[train] Run via: python -m tensaku.cli train -c /path/to/cfg.yaml")
+    print("[train] Run via CLI: tensaku train -c <CFG.yaml>")

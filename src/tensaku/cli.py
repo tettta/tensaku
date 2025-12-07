@@ -72,18 +72,26 @@ COMMANDS: Dict[str, SubcommandFunc] = {
     "train":            _lazy_runner("train"),
     "infer-pool":       _lazy_runner("infer_pool"),
     "infer_pool":       _lazy_runner("infer_pool"),
+
     "confidence":       _lazy_runner("confidence"),
     "gate":             _lazy_runner("gate"),
     "eval":             _lazy_runner("eval"),
+    
+    "hitl-report":      _lazy_runner("hitl_report"),
+    "hitl_report":      _lazy_runner("hitl_report"),
+
     "al-sample":        _lazy_runner("al_sample"),
     "al_sample":        _lazy_runner("al_sample"),
     "al-label-import":  _lazy_runner("al_label_import"),
     "al_label_import":  _lazy_runner("al_label_import"),
     "al-cycle":         _lazy_runner("al_cycle"),
     "al_cycle":         _lazy_runner("al_cycle"),
-    "hitl-report":      _lazy_runner("hitl_report"),
-    "hitl_report":      _lazy_runner("hitl_report"),
-    "al-oracle-labels": _lazy_runner("al_oracle_labels"), # 追加: al.shで使う
+    "al-oracle-labels": _lazy_runner("al_oracle_labels"),
+
+    "al-run":           _lazy_runner("pipelines.al", func_name="run_experiment"),
+
+    "config-dump":      _lazy_runner("config_dump"),
+    "config_dump":      _lazy_runner("config_dump"),  # alias
 }
 
 def main(argv: Optional[List[str]] = None) -> int:

@@ -1,62 +1,37 @@
 # /home/esakit25/work/tensaku/src/tensaku/models.py
-# -*- coding: utf-8 -*-
-"""
-@module     : tensaku.models
-@role       : モデルとトークナイザのファクトリ
-@note       : 将来的に独自のアーキテクチャを追加する場合はここを拡張する。
-"""
-
 from __future__ import annotations
-from typing import Any, Dict, Optional
-
-import torch
+import logging
+from typing import Any, Mapping, Optional
 import torch.nn as nn
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
+from transformers import AutoConfig, AutoModelForSequenceClassification, AutoTokenizer, PreTrainedModel, PreTrainedTokenizerBase
 
-def create_tokenizer(cfg: Dict[str, Any]):
-    """設定からトークナイザを生成して返す"""
+LOGGER = logging.getLogger(__name__)
+DEF_MODEL_NAME = "cl-tohoku/bert-base-japanese-v3"
+
+def create_tokenizer(cfg: Mapping[str, Any]) -> PreTrainedTokenizerBase:
     model_cfg = cfg.get("model", {})
-    name = model_cfg.get("name", "cl-tohoku/bert-base-japanese-v3")
-    
-    try:
-        tok = AutoTokenizer.from_pretrained(name)
-    except Exception as e:
-        print(f"[models] ERROR: Failed to load tokenizer '{name}': {e}")
-        raise e
-        
-    return tok
+    model_name = model_cfg.get("name", DEF_MODEL_NAME)
+    return AutoTokenizer.from_pretrained(model_name)
 
-def create_model(cfg: Dict[str, Any], n_class: int):
-    """設定とクラス数に基づいてモデルを生成して返す"""
+def create_model(cfg: Mapping[str, Any], num_labels: int, state_dict: Optional[Mapping[str, Any]] = None) -> PreTrainedModel:
     model_cfg = cfg.get("model", {})
-    name = model_cfg.get("name", "cl-tohoku/bert-base-japanese-v3")
+    model_name = model_cfg.get("name", DEF_MODEL_NAME)
+    freeze_base = bool(model_cfg.get("freeze_base", False))
     
-    # --- 将来の拡張ポイント ---
-    # if name == "my_custom_brain_model":
-    #     return MyCustomBrainModel(num_labels=n_class)
-    # -----------------------
+    hf_config = AutoConfig.from_pretrained(model_name, num_labels=num_labels)
+    if "dropout" in model_cfg:
+        hf_config.hidden_dropout_prob = float(model_cfg["dropout"])
+        hf_config.attention_probs_dropout_prob = float(model_cfg["dropout"])
 
-    # デフォルト: HuggingFace AutoModel
-    print(f"[models] Loading AutoModel: {name} (num_labels={n_class})")
-    try:
-        model = AutoModelForSequenceClassification.from_pretrained(name, num_labels=n_class)
-    except Exception as e:
-        print(f"[models] ERROR: Failed to load model '{name}': {e}")
-        raise e
+    model = AutoModelForSequenceClassification.from_pretrained(model_name, config=hf_config)
+    
+    if state_dict is not None:
+        model.load_state_dict(state_dict, strict=False)
 
-    # Speed / Freeze 設定の適用
-    # "frozen" 指定時は、分類ヘッド以外（バックボーン）を凍結する
-    speed = model_cfg.get("speed", "full")
-    if speed in ("frozen", "fe_sklearn"):
-        print(f"[models] Freezing backbone layers (speed={speed})")
-        # BERT系
-        if hasattr(model, "bert"):
-            for p in model.bert.parameters():
-                p.requires_grad = False
-        # RoBERTa系
-        elif hasattr(model, "roberta"):
-             for p in model.roberta.parameters():
-                p.requires_grad = False
-        # DeBERTa系など必要に応じて追加
-
+    if freeze_base:
+        for name, param in model.named_parameters():
+            if "classifier" in name or "score" in name or "head" in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
     return model

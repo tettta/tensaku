@@ -196,6 +196,36 @@ def main():
         plt.savefig(save_path)
         plt.close()
         print(f"Saved plot: {save_path}")
+    
+    def plot_bar_last(metric_col, ylabel, title, fname_base, higher_is_better=True):
+        """最終ラウンドの集計結果を棒グラフで比較する"""
+        if df_last is None or df_last.empty or metric_col not in df_last.columns:
+            return
+
+        # 対象指標のみ抽出
+        df_metric = df_last[["plot_label", metric_col]].dropna()
+        if df_metric.empty:
+            return
+
+        # ラベルごとに平均（同じ条件で複数 run があれば平均値）
+        grouped = df_metric.groupby("plot_label")[metric_col].mean()
+
+        # 指標の向きに応じてソート方向を切り替え
+        grouped = grouped.sort_values(ascending=not higher_is_better)
+
+        plt.figure(figsize=(8, max(4, 0.4 * len(grouped))))
+        plt.barh(grouped.index, grouped.values)
+
+        plt.xlabel(ylabel)
+        plt.title(f"Final Round Summary ({title}) - {args.qid} {args.title_suffix}")
+        plt.tight_layout()
+
+        fname = f"{fname_base}{args.title_suffix}.png"
+        save_path = os.path.join(out_dir, fname)
+        plt.savefig(save_path)
+        plt.close()
+        print(f"Saved summary bar: {save_path}")
+
 
     # 6. 実行 (全指標)
     print(f"\n[plot] Generating plots to {out_dir}...")
@@ -213,6 +243,21 @@ def main():
     for col, ylab, tit, fn in metrics:
         if col in df_all.columns:
             plot_metric(col, ylab, tit, fn)
+
+        # 最終ラウンドのサマリー棒グラフ（QWK/RMSE/CSE/Coverage/AURC）
+    bar_metrics = [
+        ("test_qwk_full", "QWK", "QWK", "bar_last_qwk", True),
+        ("test_rmse_full", "RMSE", "RMSE", "bar_last_rmse", False),
+        ("test_cse_full", "CSE", "CSE", "bar_last_cse", False),
+        ("test_coverage_gate", "Coverage", "Coverage", "bar_last_coverage", True),
+        ("aurc_cse", "AURC", "AURC(CSE)", "bar_last_aurc", False),
+    ]
+
+    if df_last is not None and not df_last.empty:
+        for col, ylab, tit, fn, hib in bar_metrics:
+            if col in df_last.columns:
+                plot_bar_last(col, ylab, tit, fn, higher_is_better=hib)
+
 
 if __name__ == "__main__":
     main()

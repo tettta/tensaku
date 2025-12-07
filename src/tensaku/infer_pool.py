@@ -3,7 +3,9 @@
 """
 @module   : tensaku.infer_pool
 @role     : dev / pool / test に対して ckpt で一括推論し、予測CSVと簡易メタ情報を out_dir に保存する。
-@updated  : models.py を使用するようにリファクタリング
+@overview :
+    - infer_core: DatasetSplit を受け取り、推論・TrustScore計算・CSV保存を行う。
+    - run       : CLI 用ラッパー。
 """
 
 from __future__ import annotations
@@ -14,17 +16,18 @@ import json
 import os
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import numpy as np
 import torch
 
-# ★変更点: models.py からファクトリ関数をインポート
+from tensaku.data.base import DatasetSplit
+# Phase2 モデル定義
 from tensaku.models import create_model, create_tokenizer
 from .model_io import select_device
 from .embed import labels_from_rows, predict_with_emb
 
-# 任意依存（trust は無ければスキップ）
 try:
     from .trustscore import TrustScorer
 except Exception:
@@ -37,7 +40,6 @@ DEF_BASE = "cl-tohoku/bert-base-japanese-v3"
 
 
 def _read_jsonl(path: str) -> List[dict]:
-    """シンプルな JSONL ローダー。存在しなければ空リスト。"""
     rows: List[dict] = []
     if not os.path.exists(path):
         return rows
@@ -53,43 +55,12 @@ def _read_jsonl(path: str) -> List[dict]:
     return rows
 
 
-def _infer_num_labels_from_rows(
-    data_dir: str,
-    files: Dict[str, str],
-    label_key: str = "score",
-) -> Optional[int]:
-    """dev/test から max(label)+1 を推定する（失敗時 None）。"""
-    max_y = -1
-    for key in ("labeled", "train", "dev", "test"):
-        fname = files.get(key)
-        if not fname:
-            if key in ("labeled", "train"):
-                fname = f"{key}.jsonl"
-            elif key in ("dev", "test"):
-                fname = f"{key}.jsonl"
-            else:
-                continue
-        path = os.path.join(data_dir, fname)
-        rows = _read_jsonl(path)
-        for r in rows:
-            try:
-                y = int(r[label_key])
-            except Exception:
-                continue
-            if y > max_y:
-                max_y = y
-    return (max_y + 1) if max_y >= 0 else None
-
-
 def _softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     x = np.asarray(x, dtype=float)
     x = x - np.max(x, axis=axis, keepdims=True)
     ex = np.exp(x)
     s = np.sum(ex, axis=axis, keepdims=True)
     return ex / np.clip(s, 1e-12, None)
-
-
-# ===== ckpt helpers ==============================================================================
 
 
 def _extract_state_dict(bundle: Any) -> Optional[Dict[str, Any]]:
@@ -119,9 +90,6 @@ def _normalize_keys(state_dict: Dict[str, Any]) -> Dict[str, Any]:
     return sd
 
 
-# ===== core inference ============================================================================
-
-
 def _pred_and_conf(logits: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     prob = _softmax(logits, axis=-1)
     y_pred = prob.argmax(axis=-1).astype(int)
@@ -146,11 +114,13 @@ def _compute_trust_for_splits(
     if not trust:
         return trust_dict
     if TrustScorer is None:
-        print("[infer-pool] WARN: TrustScorer が利用できないため --trust を無視します。", file=sys.stderr)
+        print("[infer_core] WARN: TrustScorer が利用できないため --trust を無視します。", file=sys.stderr)
         return trust_dict
 
     train_name = None
     train_rows: List[dict] = []
+    
+    # 学習データの埋め込みが必要
     if "labeled" in outputs and outputs["labeled"].get("embs") is not None and labeled_rows:
         train_name = "labeled"
         train_rows = labeled_rows
@@ -158,13 +128,13 @@ def _compute_trust_for_splits(
         train_name = "dev"
         train_rows = dev_rows
     else:
-        print("[infer-pool] WARN: TrustScore 学習用の埋め込みが無いため計算をスキップします。", file=sys.stderr)
+        print("[infer_core] WARN: TrustScore 学習用の埋め込みが無いため計算をスキップします。", file=sys.stderr)
         return trust_dict
 
     train_embs = outputs[train_name]["embs"]
     train_labels = labels_from_rows(train_rows, label_key=label_key)
     if train_labels is None:
-        print(f"[infer-pool] WARN: {train_name} にラベルが無いため TrustScore を計算できません。", file=sys.stderr)
+        print(f"[infer_core] WARN: {train_name} にラベルが無いため TrustScore を計算できません。", file=sys.stderr)
         return trust_dict
 
     scorer = TrustScorer(
@@ -186,133 +156,109 @@ def _compute_trust_for_splits(
     return trust_dict
 
 
-def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
-    """研究モード用の dev/pool/test 一括推論エントリポイント。"""
-    
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--batch-size", type=int, default=None)
-    parser.add_argument("--max-len", type=int, default=None)
-    parser.add_argument("--device", type=str, default=None)
-    parser.add_argument("--trust", action="store_true", default=None)
-    parser.add_argument("--trust-k", type=int, default=1)
-    parser.add_argument("--trust-metric", choices=["cosine", "euclidean"], default="cosine")
-    ns, _rest = parser.parse_known_args(argv or [])
+# =============================================================================
+# infer_core
+# =============================================================================
 
-    run_cfg = cfg.get("run") or {}
-    data_cfg = cfg.get("data") or {}
-    model_cfg = cfg.get("model") or {}
-    infer_cfg = cfg.get("infer") or {}
 
-    data_dir = run_cfg.get("data_dir") or data_cfg.get("data_dir")
-    out_dir = run_cfg.get("out_dir") or "./outputs"
-    if not data_dir:
-        print("[infer-pool] ERROR: run.data_dir または data.data_dir が未設定です。", file=sys.stderr)
-        return 2
+def infer_core(
+    split: DatasetSplit,
+    out_dir: Path,
+    cfg: Mapping[str, Any],
+) -> int:
+    """
+    メモリ上の DatasetSplit を受け取り、推論を実行するコア関数。
+    """
+    run_cfg = cfg.get("run", {})
+    data_cfg = cfg.get("data", {})
+    model_cfg = cfg.get("model", {})
+    infer_cfg = cfg.get("infer", {})
 
-    files_cfg = data_cfg.get("files") or {}
-    file_labeled = files_cfg.get("labeled", "labeled.jsonl")
-    file_dev = files_cfg.get("dev", "dev.jsonl")
-    file_pool = files_cfg.get("pool", "pool.jsonl")
-    file_test = files_cfg.get("test", "test.jsonl")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     label_key = data_cfg.get("label_key", "score")
     id_key = data_cfg.get("id_key", "id")
 
-    os.makedirs(out_dir, exist_ok=True)
+    # ---- データ取り出し ----
+    labeled_rows = split.labeled
+    dev_rows = split.dev
+    pool_rows = split.pool
+    test_rows = split.test
 
-    # ---- JSONL 読み込み ----
-    path_pool = os.path.join(data_dir, file_pool)
-    pool_rows = _read_jsonl(path_pool)
-    if not pool_rows:
-        print(f"[infer-pool] ERROR: pool が空 or 不存在: {path_pool}", file=sys.stderr)
-        return 2
-
-    path_dev = os.path.join(data_dir, file_dev)
-    path_test = os.path.join(data_dir, file_test)
-    dev_rows = _read_jsonl(path_dev)
-    test_rows = _read_jsonl(path_test)
-    
-    path_labeled = os.path.join(data_dir, file_labeled)
-    labeled_rows = _read_jsonl(path_labeled)
+    if not pool_rows and not dev_rows and not test_rows:
+        print("[infer_core] WARN: All target splits (dev/pool/test) are empty.")
+        return 0
 
     # ---- モデル名・ckpt ----
     model_name = model_cfg.get("name") or DEF_BASE
-    ckpt_default = os.path.join(out_dir, "checkpoints_min", "best.pt")
-    ckpt_path = infer_cfg.get("ckpt") or model_cfg.get("ckpt") or ckpt_default
+    ckpt_path = infer_cfg.get("ckpt") or model_cfg.get("ckpt")
+    
+    if not ckpt_path:
+        base_out = run_cfg.get("out_dir", "./outputs")
+        ckpt_path = os.path.join(base_out, "checkpoints_min", "best.pt")
 
     allow_random = bool(infer_cfg.get("allow_random", False))
-    has_ckpt = os.path.exists(ckpt_path)
+    has_ckpt = os.path.exists(ckpt_path) if ckpt_path else False
 
     if not has_ckpt and not allow_random:
-        print(f"[infer-pool] ERROR: ckpt が見つかりません: {ckpt_path}", file=sys.stderr)
+        print(f"[infer_core] ERROR: ckpt が見つかりません: {ckpt_path}", file=sys.stderr)
         return 2
 
     # ---- n_class の決定 ----
     n_class: Optional[int] = model_cfg.get("num_labels")
     state_dict = None
     
-    # ckptからラベル数推定を試みる
     if n_class is None and has_ckpt:
         try:
             bundle = torch.load(ckpt_path, map_location="cpu")
             sd_raw = _extract_state_dict(bundle)
             if sd_raw is not None:
-                # 分類層のshapeから推定
                 for key in ["classifier.weight", "score.weight", "head.weight"]:
                     if key in sd_raw and hasattr(sd_raw[key], "shape"):
                         n_class = int(sd_raw[key].shape[0])
                         break
-                if n_class is None:
-                    for k, v in sd_raw.items():
-                        if k.endswith("classifier.weight") and hasattr(v, "shape"):
-                            n_class = int(v.shape[0])
-                            break
                 state_dict = _normalize_keys(sd_raw)
         except Exception as e:
-            print(f"[infer-pool] WARN: Failed to inspect ckpt for num_labels: {e}")
+            print(f"[infer_core] WARN: Failed to inspect ckpt for num_labels: {e}")
 
-    if n_class is None:
-        n_class = _infer_num_labels_from_rows(data_dir, files_cfg, label_key=label_key)
     if n_class is None:
         n_class = int(model_cfg.get("num_labels_fallback", 6))
 
-    # ---- tokenizer / model 構築 (models.py 委譲) ----
-    # ★変更点: models.py の create_tokenizer, create_model を使用
-    print(f"[infer-pool] Creating model (n_class={n_class}) via models.py...")
+    # ---- tokenizer / model 構築 ----
+    print(f"[infer_core] Creating model (n_class={n_class})...")
     tokenizer = create_tokenizer(cfg)
     model = create_model(cfg, n_class)
 
     # ckpt ロード
     if has_ckpt:
         if state_dict is None:
-            # まだロードしていなければここで読む
             try:
                 bundle = torch.load(ckpt_path, map_location="cpu")
                 sd_raw = _extract_state_dict(bundle)
                 state_dict = _normalize_keys(sd_raw) if sd_raw is not None else None
             except Exception as e:
-                print(f"[infer-pool] ERROR: Failed to load ckpt: {e}", file=sys.stderr)
+                print(f"[infer_core] ERROR: Failed to load ckpt: {e}", file=sys.stderr)
                 return 2
         
         if state_dict is not None:
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if missing or unexpected:
-                print(f"[infer-pool] WARN: load_state_dict mismatch: missing={len(missing)}, unexpected={len(unexpected)}", file=sys.stderr)
+                print(f"[infer_core] WARN: load_state_dict mismatch: missing={len(missing)}, unexpected={len(unexpected)}", file=sys.stderr)
         else:
-            print("[infer-pool] WARN: ckpt から有効な state_dict を取り出せませんでした（ランダム初期化のまま続行）。", file=sys.stderr)
+            print("[infer_core] WARN: ckpt から有効な state_dict を取り出せませんでした。", file=sys.stderr)
     else:
-        print("[infer-pool] WARN: Running with random initialization (no ckpt).")
+        print("[infer_core] WARN: Running with random initialization (no ckpt).")
 
-    device_name = ns.device or infer_cfg.get("device", "auto")
+    device_name = infer_cfg.get("device", "auto")
     dev = select_device(device_name)
     model = model.to(dev).eval()
 
-    max_len = int(ns.max_len if ns.max_len is not None else infer_cfg.get("max_len", 128))
-    batch_size = int(ns.batch_size if ns.batch_size is not None else infer_cfg.get("batch_size", 32))
+    max_len = int(infer_cfg.get("max_len", 128))
+    batch_size = int(infer_cfg.get("batch_size", 32))
 
-    trust_flag = bool(ns.trust if ns.trust is not None else infer_cfg.get("trust", False))
-    trust_k = int(ns.trust_k)
-    trust_metric = ns.trust_metric
+    trust_flag = bool(infer_cfg.get("trust", False))
+    trust_k = int(infer_cfg.get("trust_k", 1))
+    trust_metric = infer_cfg.get("trust_metric", "cosine")
     trust_version = infer_cfg.get("trust_version", "v2")
 
     # ---- 各 split で埋め込み＋logits を計算 ----
@@ -339,14 +285,15 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
             "conf_msp": conf_msp,
         }
 
-    # labeled（train）も埋め込みを計算しておく（trust の学習集合用）
-    _process_split("labeled", labeled_rows)
+    # TrustScore学習用に labeled も計算
+    if trust_flag and labeled_rows:
+        _process_split("labeled", labeled_rows)
 
     _process_split("dev", dev_rows)
     _process_split("pool", pool_rows)
     _process_split("test", test_rows)
 
-    # ---- Trust Score（任意） ----
+    # ---- Trust Score ----
     trust_dict = _compute_trust_for_splits(
         trust=trust_flag,
         labeled_rows=labeled_rows,
@@ -360,61 +307,115 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
         trust_version=trust_version,
     )
 
-    # ---- Logits & Embeddings 書き出し ----
+    # ---- 書き出し ----
     for split_name in ("dev", "pool", "test"):
         if split_name in outputs:
+            # logits / embs
             if outputs[split_name].get("logits") is not None:
-                path_logits = os.path.join(out_dir, f"{split_name}_logits.npy")
-                np.save(path_logits, outputs[split_name]["logits"])
-            
+                np.save(out_dir / f"{split_name}_logits.npy", outputs[split_name]["logits"])
             if outputs[split_name].get("embs") is not None:
-                path_embs = os.path.join(out_dir, f"{split_name}_embs.npy")
-                np.save(path_embs, outputs[split_name]["embs"])
+                np.save(out_dir / f"{split_name}_embs.npy", outputs[split_name]["embs"])
 
-    # ---- CSV 書き出し ----
-    def _write_csv(path_csv: str, data: Dict[str, Any], trust_vals: Optional[np.ndarray], has_true: bool) -> None:
+    # CSV 書き出し
+    def _write_csv(path_csv: Path, data: Dict[str, Any], trust_vals: Optional[np.ndarray], has_true: bool) -> None:
         rows = data["rows"]
         y_pred = data["y_pred"]
         conf_msp = data["conf_msp"]
+        
+        # ヘッダ作成 (y_true は必要な場合のみ)
+        header = ["id", "y_pred", "conf_msp", "conf_trust"]
+        if has_true:
+            header.append("y_true")
+
         with open(path_csv, "w", encoding="utf-8", newline="") as f:
-            cols = ["id"]
-            if has_true: cols.append("y_true")
-            cols.extend(["y_pred", "conf_msp"])
-            if trust_vals is not None: cols.append("conf_trust")
             writer = csv.writer(f)
-            writer.writerow(cols)
+            writer.writerow(header)
+            
             for i, (r, yp, cm) in enumerate(zip(rows, y_pred, conf_msp)):
                 rid = r.get(id_key, str(i))
-                row = [rid]
+                
+                # スコア初期化
+                tr_val = trust_vals[i] if trust_vals is not None else 0.0
+                
+                row_data = [rid, int(yp), float(cm), float(tr_val)]
+                
                 if has_true:
-                    try: yt = int(r.get(label_key, 0))
-                    except: yt = 0
-                    row.append(yt)
-                row.extend([int(yp), float(cm)])
-                if trust_vals is not None:
-                    row.append(float(trust_vals[i]))
-                writer.writerow(row)
+                    try: yt = int(r.get(label_key, -1))
+                    except: yt = -1
+                    row_data.append(yt)
+                    
+                writer.writerow(row_data)
 
     if "dev" in outputs:
-        _write_csv(os.path.join(out_dir, "dev_preds.csv"), outputs["dev"], trust_dict.get("dev"), True)
+        _write_csv(out_dir / "dev_preds.csv", outputs["dev"], trust_dict.get("dev"), True)
     if "pool" in outputs:
-        _write_csv(os.path.join(out_dir, "pool_preds.csv"), outputs["pool"], trust_dict.get("pool"), False)
+        _write_csv(out_dir / "pool_preds.csv", outputs["pool"], trust_dict.get("pool"), False)
     if "test" in outputs and outputs["test"]["rows"]:
-        _write_csv(os.path.join(out_dir, "test_preds.csv"), outputs["test"], trust_dict.get("test"), True)
+        _write_csv(out_dir / "test_preds.csv", outputs["test"], trust_dict.get("test"), True)
 
-    # ---- meta 書き出し ----
+    # meta 書き出し
     meta = {
         "model_name": model_name,
         "ckpt": ckpt_path if has_ckpt else None,
         "n_class": int(n_class),
-        "data_dir": data_dir,
         "generated_at": time.strftime("%F %T"),
     }
-    with open(os.path.join(out_dir, "pool_preds.meta.json"), "w", encoding="utf-8") as f:
+    with open(out_dir / "infer.meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     return 0
 
 
+# =============================================================================
+# CLI エントリポイント
+# =============================================================================
+
+
+def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
+    """CLI ラッパー。"""
+    if cfg is None and isinstance(argv, dict):
+        cfg = argv
+        argv = []
+    if cfg is None:
+        raise ValueError("tensaku.infer_pool.run requires cfg dict")
+
+    run_cfg = cfg.get("run", {})
+    data_cfg = cfg.get("data", {})
+    
+    data_dir = run_cfg.get("data_dir") or data_cfg.get("data_dir")
+    out_dir_str = run_cfg.get("out_dir") or "./outputs"
+    
+    if not data_dir:
+        print("[infer_pool] ERROR: run.data_dir is not set.")
+        return 2
+
+    files_cfg = data_cfg.get("files") or {}
+    file_labeled = files_cfg.get("labeled", "labeled.jsonl")
+    file_dev = files_cfg.get("dev", "dev.jsonl")
+    file_pool = files_cfg.get("pool", "pool.jsonl")
+    file_test = files_cfg.get("test", "test.jsonl")
+
+    # JSONL 読み込み
+    pool_rows = _read_jsonl(os.path.join(data_dir, file_pool))
+    dev_rows = _read_jsonl(os.path.join(data_dir, file_dev))
+    test_rows = _read_jsonl(os.path.join(data_dir, file_test))
+    labeled_rows = _read_jsonl(os.path.join(data_dir, file_labeled))
+
+    if not pool_rows and not dev_rows:
+        print(f"[infer_pool] ERROR: pool or dev empty in {data_dir}", file=sys.stderr)
+        return 2
+
+    split = DatasetSplit(
+        labeled=labeled_rows,
+        dev=dev_rows,
+        test=test_rows,
+        pool=pool_rows
+    )
+
+    out_dir = Path(out_dir_str)
+    
+    return infer_core(split=split, out_dir=out_dir, cfg=cfg)
+
+
 if __name__ == "__main__":
-    print("Run via CLI: tensaku infer-pool -c <CFG.yaml>")
+    print("[infer-pool] Run via CLI: tensaku infer-pool -c <CFG.yaml>")

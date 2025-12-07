@@ -21,6 +21,9 @@ data:
   id_key: id
   max_len: 128 # 高速化のため短縮
 
+task:
+  name: sas_total_score
+
 split:
   enable: false
   ratio:
@@ -49,6 +52,7 @@ train:
 
 infer:
   ckpt: null
+  trust: true
   trust_version: v2
 
 calibration:
@@ -92,7 +96,7 @@ viz:
     - conf_trust
 
 gate:
-  conf_name: conf_trust
+  conf_key: trust
   eps_cse: 0.05
   eps_list: [0.02, 0.05]
   cse_abs_err: 2
@@ -114,7 +118,7 @@ al:
     name: uncertainty       # uncertainty, random, hybrid, clustering
     uncertainty: trust      # msp, trust, entropy
     alpha: 3.0              # Hybrid用: 不確実性で絞る倍率 (Budget * alpha)
-    k_center: 200           # 将来用
+    k_center: 200           # Clustering用: センター数
 
 logging:
   level: INFO

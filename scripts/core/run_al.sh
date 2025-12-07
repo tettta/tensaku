@@ -99,6 +99,22 @@ ENV_LOG="${OUT_DIR}/env_info.txt"
   pip freeze | grep -E "torch|transformers|numpy|pandas" || echo ""
 } > "${ENV_LOG}"
 
+
+DUMP_OUT="${OUT_DIR}/exp_config.yaml"
+DUMP_ARGS=(
+  config-dump -c "${CFG}"
+  "${COMMON_ARGS[@]}"
+  --set "split.n_train=${START_SIZE}"
+  --set "al.rounds=${ROUNDS}"
+  --set "al.budget=${BUDGET}"
+  --set "al.sampler.name=${AL_SAMPLER}"
+  --set "al.sampler.uncertainty=${AL_BY}"
+  --out "${DUMP_OUT}"
+)
+
+tensaku "${DUMP_ARGS[@]}"
+
+
 # --- データ準備 ---
 mkdir -p "${OUT_DIR}" "${DATA_DIR}"
 MISSING_FILES=0
