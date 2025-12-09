@@ -22,6 +22,20 @@ import pandas as pd
 
 from tensaku.al.state import ALState
 from tensaku.experiments.layout import ExperimentLayout
+from tensaku.registry import register as _register_global, create as _registry_create
+
+
+SAMPLER_REGISTRY_PREFIX = "sampler/"
+
+def register_sampler(name: str, *, override: bool = False):
+    """
+    Sampler 用のレジストリデコレータ。
+    - registry 上のキーは 'sampler/<name>' という名前空間付きにする。
+    - 使い方: @register_sampler("random") / @register_sampler("hybrid") など
+    """
+    key = SAMPLER_REGISTRY_PREFIX + str(name)
+    return _register_global(key, override=override)
+
 
 LOGGER = logging.getLogger(__name__)
 
@@ -357,51 +371,144 @@ class HybridSampler(BaseSampler):
 
 
 # ======================================================================
+# Sampler factory registration (registry 統合)
+# ======================================================================
+
+@register_sampler("random")
+def _factory_random_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """ランダムサンプラーの factory。"""
+    return RandomSampler(seed=seed)
+
+
+@register_sampler("uncertainty")
+def _factory_uncertainty_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """
+    不確実性サンプラーの factory。
+    - どの conf カラムを使うか（trust/msp 等）は現状 Standard タスク側で決定。
+    - ここでは strategy や seed など sampler 固有の設定だけを見る。
+    """
+    strat = sampler_cfg.get("uncertainty_strategy", "least_confidence")
+    return UncertaintySampler(seed=seed, strategy=strat)
+
+
+@register_sampler("clustering")
+def _factory_clustering_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """
+    クラスタリングサンプラーの factory。
+    - out_dir は ExperimentLayout を張るために run.out_dir から渡す。
+    """
+    out_dir = cfg.get("run", {}).get("out_dir", "")
+    k = sampler_cfg.get("k", None)
+    return ClusteringSampler(seed=seed, out_dir=out_dir, k=k)
+
+
+@register_sampler("hybrid")
+def _factory_hybrid_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """
+    ハイブリッドサンプラーの factory。
+    - 不確実性部分の strategy や、多様性部分のクラスタ数などをここで解釈する。
+    """
+    out_dir = cfg.get("run", {}).get("out_dir", "")
+    strat = sampler_cfg.get("uncertainty_strategy", "least_confidence")
+    k = sampler_cfg.get("k", None)
+    ratio = sampler_cfg.get("sub_budget_ratio", 5.0)
+
+    return HybridSampler(
+        seed=seed,
+        out_dir=out_dir,
+        uncertainty_strategy=strat,
+        sub_budget_ratio=ratio,
+        k_cluster=k,
+    )
+
+# ======================================================================
 # Factory
 # ======================================================================
 
 def create_sampler(cfg: Mapping[str, Any]) -> BaseSampler:
-    """cfg から Sampler インスタンスを構築するファクトリ関数。"""
+    """
+    cfg から Sampler インスタンスを構築するファクトリ関数。
+    - 実体は tensaku.registry に登録された factory に委譲する。
+    - 新しい Sampler を追加したいときは register_sampler(...) 付き factory を定義すればよい。
+
+    対応する設定形式:
+      1) 文字列形式
+         al:
+           sampler: "uncertainty"
+
+      2) 辞書形式
+         al:
+           sampler:
+             name: "uncertainty"
+             uncertainty_strategy: "least_confidence"
+             k: 32
+    """
     al_cfg = cfg.get("al", {})
-    sampler_cfg = al_cfg.get("sampler", {}) if isinstance(al_cfg, Mapping) else {}
-    
-    # 名前解決
-    name_raw = sampler_cfg.get("name", "random")
+
+    # sampler 設定を取り出し、型に応じて正規化
+    sampler_cfg_raw = al_cfg.get("sampler", {}) if isinstance(al_cfg, Mapping) else {}
+
+    if isinstance(sampler_cfg_raw, Mapping):
+        # 既に dict で渡されているケース
+        sampler_cfg: Mapping[str, Any] = sampler_cfg_raw
+        name_raw = sampler_cfg.get("name")
+    else:
+        # 文字列などが直接入っているケース → sampler 名として扱う
+        sampler_cfg = {}
+        name_raw = sampler_cfg_raw
+
+    if not name_raw:
+        name_raw = "random"
     name = str(name_raw).lower()
 
     # シード
     seed = al_cfg.get("seed")
     if not isinstance(seed, int):
         seed = None
-        
-    # 出力ディレクトリ (埋め込みロード用)
-    out_dir = cfg.get("run", {}).get("out_dir", "")
-    
-    # 個別パラメータ
-    strat = sampler_cfg.get("uncertainty_strategy", "least_confidence")
-    k = sampler_cfg.get("k", None)
-    ratio = sampler_cfg.get("sub_budget_ratio", 5.0)
 
-    # インスタンス生成
-    if name == "random":
-        return RandomSampler(seed=seed)
+    key = SAMPLER_REGISTRY_PREFIX + name
 
-    if name == "uncertainty":
-        return UncertaintySampler(seed=seed, strategy=strat)
-
-    if name == "clustering":
-        return ClusteringSampler(seed=seed, out_dir=out_dir, k=k)
-
-    if name == "hybrid":
-        return HybridSampler(
-            seed=seed, 
-            out_dir=out_dir, 
-            uncertainty_strategy=strat, 
-            sub_budget_ratio=ratio,
-            k_cluster=k
+    try:
+        sampler = _registry_create(
+            key,
+            cfg=cfg,
+            sampler_cfg=sampler_cfg,
+            seed=seed,
+        )
+    except KeyError:
+        LOGGER.warning(
+            "Unknown sampler name '%s'. Falling back to RandomSampler.",
+            name,
+        )
+        sampler = _registry_create(
+            SAMPLER_REGISTRY_PREFIX + "random",
+            cfg=cfg,
+            sampler_cfg=sampler_cfg,
+            seed=seed,
         )
 
-    LOGGER.warning(
-        f"Unknown sampler name '{name}'. Falling back to RandomSampler."
-    )
-    return RandomSampler(seed=seed)
+    if not isinstance(sampler, BaseSampler):
+        raise TypeError(
+            f"Sampler factory '{key}' must return BaseSampler, got {type(sampler)}"
+        )
+    return sampler

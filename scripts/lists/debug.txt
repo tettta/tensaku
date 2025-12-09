@@ -1,3 +1,0 @@
-# NAME              AL_BY     AL_SAMPLER
-exp_al_entropy      entropy   uncertainty
-exp_al_msp          msp       uncertainty

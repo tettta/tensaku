@@ -2,6 +2,7 @@
 from __future__ import annotations
 from typing import Any, Dict, List
 import os, yaml
+from pathlib import Path
 
 def _deep_set(d: Dict[str, Any], keys: List[str], value: Any) -> None:
     x = d
@@ -33,8 +34,12 @@ def load_config(path: str, overrides: List[str] | None = None) -> Dict[str, Any]
     # def abs_path(p: str | None) -> str | None:
     #     return p if (p is None or os.path.isabs(p)) else os.path.normpath(os.path.join(base, p))
 
-    # 【修正】プロジェクトルートをベースとする
-    ROOT_DIR = "/home/esakit25/work/tensaku" # ユーザーの環境変数 $ROOT に相当
+    # tensaku/config.py
+
+    # 環境変数 TENSAKU_ROOT があればそれを使い、なければこのファイルの2つ上の階層をルートとする
+    _default_root = Path(__file__).resolve().parent.parent.parent
+    ROOT_DIR = os.getenv("TENSAKU_ROOT", str(_default_root))
+
     def abs_path(p: str | None) -> str | None:
         if p is None: return None
         # 絶対パスか、相対パスか（. / .. で始まっているか）

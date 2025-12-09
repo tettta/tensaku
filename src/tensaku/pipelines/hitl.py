@@ -40,7 +40,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from tensaku.gate_core import (
+from tensaku.gate import (
     GateConfig,
     GateInputs,
     GateDevResult,

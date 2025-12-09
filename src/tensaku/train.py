@@ -4,12 +4,14 @@
 @module     : tensaku.train
 @role       : 分類モデルの学習実行（I/O 分離・統合版）
 @overview   :
-    - train_core: DatasetSplit (メモリ上データ) を受け取り、学習を実行するコアロジック
-    - run       : CLI 用ラッパー。JSONL ファイルを読み込み train_core を呼ぶ
+    - train_core: DatasetSplit (メモリ上データ) を受け取り、学習を実行するコアロジック。
+                  学習済みモデルを返すオプションあり。
+    - run       : CLI 用ラッパー。
 """
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import json
@@ -31,6 +33,8 @@ from tensaku.data.base import DatasetSplit
 # モデル定義 (Phase2)
 from tensaku.models import create_model, create_tokenizer
 
+LOGGER = logging.getLogger(__name__)
+
 
 # =============================================================================
 # ユーティリティ
@@ -40,7 +44,7 @@ from tensaku.models import create_model, create_tokenizer
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not os.path.exists(path):
-        print(f"[train] ERROR: file not found: {path}")
+        LOGGER.error(f"File not found: {path}")
         return rows
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -62,10 +66,10 @@ def _load_meta_if_exists(data_dir: str) -> Dict[str, Any]:
         with open(path, "r", encoding="utf-8") as f:
             meta = json.load(f)
     except Exception as e:
-        print(f"[train] WARN: failed to read meta.json: {path} ({e})")
+        LOGGER.warning(f"Failed to read meta.json: {path} ({e})")
         return {}
     if not isinstance(meta, dict):
-        print(f"[train] WARN: meta.json is not a JSON object: {path}")
+        LOGGER.warning(f"meta.json is not a JSON object: {path}")
         return {}
     return meta
 
@@ -97,7 +101,7 @@ def _normalize_labels(
             max_y = y
 
     if bad > 0:
-        print(f"[train] warn: skipped {bad} rows in {split_name} due to invalid '{label_key}'")
+        LOGGER.warning(f"Skipped {bad} rows in {split_name} due to invalid '{label_key}'")
 
     return clean, min_y, max_y
 
@@ -116,11 +120,13 @@ def _analyze_token_lengths(rows: List[Dict[str, Any]], tok, text_key: str, split
         return
     
     lengths = np.array(lengths)
-    print(f"[train] Token Stats ({split_name}): "
-          f"Mean={lengths.mean():.1f}, "
-          f"Median={np.median(lengths):.1f}, "
-          f"Max={lengths.max()}, "
-          f"95%tile={np.percentile(lengths, 95):.1f}")
+    LOGGER.info(
+        f"Token Stats ({split_name}): "
+        f"Mean={lengths.mean():.1f}, "
+        f"Median={np.median(lengths):.1f}, "
+        f"Max={lengths.max()}, "
+        f"95%tile={np.percentile(lengths, 95):.1f}"
+    )
 
 
 class EssayDS(Dataset):
@@ -198,7 +204,9 @@ def train_core(
     out_dir: Path,
     cfg: Mapping[str, Any],
     meta: Optional[Dict[str, Any]] = None,
-) -> int:
+    return_model: bool = False,
+    save_checkpoints: bool = True,
+) -> Tuple[int, Optional[Any]]:
     """
     メモリ上のデータ (split) を用いて学習を実行するコア関数。
     """
@@ -219,14 +227,13 @@ def train_core(
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # データの取得 (DatasetSplit -> List[Dict])
-    # train には labeled を使用する
+    # データの取得
     rows_tr_raw = split.labeled
     rows_dv_raw = split.dev
 
     if not rows_tr_raw:
-        print(f"[train_core] ERROR: missing labeled data.")
-        return 1
+        LOGGER.error("Missing labeled data.")
+        return 1, None
     
     # ラベル正規化
     rows_tr, min_tr, max_tr = _normalize_labels(rows_tr_raw, label_key, "train/labeled")
@@ -236,8 +243,8 @@ def train_core(
         rows_dv, min_dv, max_dv = [], None, None
 
     if not rows_tr:
-        print("[train_core] ERROR: no valid training data.")
-        return 1
+        LOGGER.error("No valid training data.")
+        return 1, None
 
     # クラス数決定ロジック
     max_candidates = [v for v in (max_tr, max_dv) if v is not None]
@@ -266,11 +273,11 @@ def train_core(
     if cfg_num_labels is not None: n_class_candidates.append(cfg_num_labels)
     n_class = max(n_class_candidates)
     
-    # トークナイザ・モデル構築 (models.py)
+    # トークナイザ・モデル構築
     tok = create_tokenizer(cfg)
     model = create_model(cfg, n_class)
 
-    print(f"[train_core] Analyzing token lengths (max_len={max_len})...")
+    LOGGER.info(f"Analyzing token lengths (max_len={max_len})...")
     _analyze_token_lengths(rows_tr, tok, text_key, "Train")
     if rows_dv:
         _analyze_token_lengths(rows_dv, tok, text_key, "Dev")
@@ -291,8 +298,7 @@ def train_core(
     if speed == "full":
         opt = AdamW(model.parameters(), lr=float(train_cfg.get("lr_full", 2e-5)))
     else:
-        # Frozen or FE_sklearn (model.freeze_base=True は models.py で処理済み)
-        # requires_grad=True のパラメータのみ Optimizer に渡す
+        # Frozen or FE_sklearn
         params = filter(lambda p: p.requires_grad, model.parameters())
         opt = AdamW(params, lr=float(train_cfg.get("lr_frozen", 5e-4)))
 
@@ -309,14 +315,14 @@ def train_core(
     patience = int(train_cfg.get("patience", -1))
     no_improve_cnt = 0
     if patience > 0:
-        print(f"[train_core] Early Stopping ENABLED: patience={patience}")
+        LOGGER.info(f"Early Stopping ENABLED: patience={patience}")
 
     AMP_ENABLED = device.type == "cuda"
     AMP_DTYPE = torch.bfloat16
     scaler = GradScaler(enabled=AMP_ENABLED)
 
-    print(
-        f"[train_core] out_dir={out_dir} n_class={n_class} speed={speed} "
+    LOGGER.info(
+        f"Start training: out_dir={out_dir} n_class={n_class} speed={speed} "
         f"device={device.type} epochs={epochs} batch_size={bs} max_len={max_len}"
     )
 
@@ -340,37 +346,61 @@ def train_core(
         # Validation
         if rows_dv:
             qwk, rmse = _eval_qwk_rmse(model, dl_dv, device, n_class)
-            print(f"[train_core] Epoch {ep}/{epochs}: Dev QWK={qwk:.4f}, RMSE={rmse:.4f}")
+            LOGGER.info(f"Epoch {ep}/{epochs}: Dev QWK={qwk:.4f}, RMSE={rmse:.4f}")
             
-            # Save Last
-            torch.save(
-                {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-                ckpt_dir / "last.pt",
-            )
+            # Save Last (制御対象)
+            if save_checkpoints:
+                torch.save(
+                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
+                    ckpt_dir / "last.pt",
+                )
             
             # Save Best & Early Stopping
             if qwk > best_qwk:
                 best_qwk = qwk
                 no_improve_cnt = 0
-                torch.save(
-                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-                    ckpt_dir / "best.pt",
-                )
+                # Save Best (制御対象)
+                if save_checkpoints:
+                    torch.save(
+                        {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
+                        ckpt_dir / "best.pt",
+                    )
             else:
                 if patience > 0:
                     no_improve_cnt += 1
                     if no_improve_cnt >= patience:
-                        print(f"[train_core] Early stopping triggered at epoch {ep}")
+                        LOGGER.info(f"Early stopping triggered at epoch {ep}")
                         break
         else:
-            print(f"[train_core] Epoch {ep}/{epochs}: (No dev data)")
+            LOGGER.info(f"Epoch {ep}/{epochs}: (No dev data)")
             torch.save(
                 {"model": model.state_dict(), "epoch": ep, "n_class": n_class},
                 ckpt_dir / "best.pt",
             )
 
-    print(f"[train_core] Training finished. Best QWK={best_qwk:.4f}")
-    return 0
+    LOGGER.info(f"Training finished. Best QWK={best_qwk:.4f}")
+
+    # インメモリ返却用ロジック
+    if return_model:
+        best_ckpt_path = ckpt_dir / "best.pt"
+        if best_ckpt_path.exists():
+            try:
+                state = torch.load(best_ckpt_path, map_location=device)
+                if "model" in state:
+                    model.load_state_dict(state["model"])
+                else:
+                    model.load_state_dict(state)
+                model.eval()
+                LOGGER.info("Reloaded best model state for in-memory return.")
+                return 0, model
+            except Exception as e:
+                LOGGER.error(f"Failed to reload best model: {e}")
+                return 1, None
+        else:
+            model.eval()
+            return 0, model
+
+    return 0, None
 
 
 # =============================================================================
@@ -381,7 +411,6 @@ def train_core(
 def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
     """
     CLI 用ラッパー。
-    Config からパスを解決し、JSONL を読み込んで DatasetSplit を構築し、train_core を呼ぶ。
     """
     if cfg is None and isinstance(argv, dict):
         cfg = argv
@@ -394,7 +423,7 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     
     data_dir = run_cfg.get("data_dir")
     if not data_dir:
-        print("[train] ERROR: run.data_dir is not set.")
+        LOGGER.error("run.data_dir is not set.")
         return 1
 
     files = data_cfg.get("files") or {}
@@ -406,10 +435,9 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     rows_dv = _read_jsonl(path_dv)
 
     if not rows_tr:
-        print(f"[train] ERROR: failed to load labeled data from {path_tr}")
+        LOGGER.error(f"Failed to load labeled data from {path_tr}")
         return 1
-    # dev は空でも許容 (train_core 側でハンドリング)
-
+    
     meta = _load_meta_if_exists(data_dir)
 
     split = DatasetSplit(
@@ -422,9 +450,14 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     out_dir_str = run_cfg.get("out_dir", "./outputs")
     out_dir = Path(out_dir_str)
 
-    # コアロジックへ委譲
-    return train_core(split=split, out_dir=out_dir, cfg=cfg, meta=meta)
+    # CLI実行時はモデル返却不要
+    ret, _ = train_core(split=split, out_dir=out_dir, cfg=cfg, meta=meta, return_model=False)
+    return ret
 
 
 if __name__ == "__main__":
-    print("[train] Run via CLI: tensaku train -c <CFG.yaml>")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+    )
+    LOGGER.info("Run via CLI: tensaku train -c <CFG.yaml>")

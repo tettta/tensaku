@@ -61,6 +61,37 @@ class ExperimentLayout:
     # ------------------------------------------------------------------
     # コンストラクタ系
     # ------------------------------------------------------------------
+    @staticmethod
+    def _get_config_value(cfg: Mapping[str, Any], keys: str, default: str) -> str:
+        """ネストされた設定値を取得するヘルパー。例: 'data.qid'"""
+        current = cfg
+        for key in keys.split('.'):
+            if not isinstance(current, Mapping) or key not in current:
+                return default
+            current = current[key]
+        return str(current)
+    
+    @classmethod
+    def resolve_final_out_dir(cls, cfg: Mapping[str, Any]) -> Path:
+        """設定 (cfg) に基づき、ExperimentLayout のルートとなる最終出力パスを決定する。
+
+        構造: ./outputs / QID / EXPERIMENT / RUN_NAME
+        """
+        run_cfg = cfg.get("run", {})
+        
+        # 必要な3つのコンポーネントを取得
+        qid = cls._get_config_value(cfg, 'data.qid', 'default_qid')
+        experiment_name = cls._get_config_value(cfg, 'run.experiment', 'default_exp')
+        run_name = cls._get_config_value(cfg, 'run.name', 'default_run')
+
+        # ベースディレクトリ (相対パス ./outputs を使用)
+        root_dir = Path("./outputs")
+        
+        # 階層構造を構築
+        final_out_dir = root_dir / qid / experiment_name / run_name
+        
+        return final_out_dir
+
     @classmethod
     def from_cfg(cls, cfg: Mapping[str, Any]) -> "ExperimentLayout":
         """設定 dict から ExperimentLayout を構築するユーティリティ。
@@ -98,6 +129,11 @@ class ExperimentLayout:
     def selection_dir(self) -> Path:
         """AL におけるサンプル選択情報を格納するディレクトリ。"""
         return self.root / "selection"
+    
+    @property
+    def rounds_dir(self) -> Path:
+        """ラウンドごとの出力を格納するディレクトリ。"""
+        return self.root / "rounds"
 
     @property
     def selection_rounds_dir(self) -> Path:
@@ -133,6 +169,13 @@ class ExperimentLayout:
     def plots_dir(self) -> Path:
         """可視化（図表）を格納するディレクトリ。"""
         return self.root / "plots"
+    
+    @property
+    def temp_data_dir(self) -> Path:
+        """一時データ格納ルートディレクトリ。 (e.g., OUT_DIR/temp_data)"""
+        return self.root / "temp_data"
+    
+
 
     # ------------------------------------------------------------------
     # ディレクトリの一括作成
@@ -197,6 +240,34 @@ class ExperimentLayout:
     def path_log_round(self, round_index: int) -> Path:
         """各ラウンド単位のログファイルのパス。"""
         return self.logs_dir / f"{self.round_name(round_index)}.log"
+    
+
+    # ------------------------------------------------------------------
+    # rounds (学習・推論・ログのラウンド別出力)
+    # ------------------------------------------------------------------
+    
+    def path_rounds_round_dir(self, round_index: int) -> Path:
+        """ラウンドごとのルートディレクトリ。
+        例: rounds/round_000/
+        """
+        return self.rounds_dir / self.round_name(round_index)
+
+    def path_rounds_train_dir(self, round_index: int) -> Path:
+        """学習結果の出力ディレクトリ。
+        例: rounds/round_000/train/
+        """
+        return self.path_rounds_round_dir(round_index) / "train"
+
+    def path_rounds_infer_dir(self, round_index: int) -> Path:
+        """推論結果の出力ディレクトリ。
+        例: rounds/round_000/infer/
+        """
+        return self.path_rounds_round_dir(round_index) / "infer"
+    
+    # ------------------------------------------------------------------
+    # models
+    def path_models_round_dir(self, round_index: int) -> Path:
+        return self.path_rounds_train_dir(round_index)
 
     # ------------------------------------------------------------------
     # metrics
@@ -292,3 +363,13 @@ class ExperimentLayout:
             filename: 例 "curve_coverage_rmse.png"
         """
         return self.plots_dir / filename
+    
+        # ------------------------------------------------------------------
+    # temp data
+    # ------------------------------------------------------------------
+    def path_temp_round_dir(self, round_index: int) -> Path:
+        """各ラウンドで利用するデータセットファイルを格納する一時ディレクトリ。
+
+        例: temp_data/round_000/
+        """
+        return self.temp_data_dir / self.round_name(round_index)

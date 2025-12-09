@@ -12,12 +12,14 @@
 
 from __future__ import annotations
 
+import sys
 import csv
 import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+import shutil
 
 import yaml  # PyYAML
 
@@ -29,7 +31,11 @@ from tensaku.al.sampler import create_sampler
 from tensaku.al.loop import run_one_step
 
 
-LOGGER_NAME = "tensaku.al.pipeline"
+# パッケージルートのロガー名
+LOGGER_NAME = "tensaku"
+# パイプライン用モジュールロガー
+LOGGER = logging.getLogger(f"{LOGGER_NAME}.pipelines.al")
+
 
 
 # ======================================================================
@@ -38,35 +44,49 @@ LOGGER_NAME = "tensaku.al.pipeline"
 
 
 def _setup_logger(log_path: Path, verbose: bool = True) -> logging.Logger:
-    """パイプライン全体のロガーをセットアップする。"""
-    logger = logging.getLogger(LOGGER_NAME)
-    logger.setLevel(logging.DEBUG)
+    """パイプライン全体のロガーをセットアップする。
 
-    # 既存ハンドラがあればクリア（重複防止）
-    if logger.handlers:
-        for h in logger.handlers:
-            logger.removeHandler(h)
+    - パッケージルートロガー "tensaku" にハンドラをぶら下げる。
+    - 各モジュールの LOGGER = logging.getLogger(__name__) からのログも
+      同じフォーマットで pipeline.log に集約される。
+    """
 
+    # ルートロガー（パッケージ単位）を構成
+    root_logger = logging.getLogger(LOGGER_NAME)
+    root_logger.setLevel(logging.INFO)
+    root_logger.propagate = False
+
+    # 既存ハンドラがあれば一旦クリア
+    if root_logger.handlers:
+        for h in list(root_logger.handlers):
+            h.close()
+            root_logger.removeHandler(h)
+
+    # ログ出力先ディレクトリを確保
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # File Handler
-    fh = logging.FileHandler(log_path, encoding="utf-8")
-    fh.setLevel(logging.DEBUG)
-    fmt = logging.Formatter(
-        fmt="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+
+    # ファイルハンドラ: 実験再現用のフルログ
+    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
+    fh.setFormatter(
+        logging.Formatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
-    fh.setFormatter(fmt)
-    logger.addHandler(fh)
+    root_logger.addHandler(fh)
 
-    # Stream Handler
+    # コンソールハンドラ: 進捗確認用（必要に応じて無効化も可能）
     if verbose:
-        ch = logging.StreamHandler()
-        ch.setLevel(logging.INFO)
-        ch.setFormatter(fmt)
-        logger.addHandler(ch)
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(
+            logging.Formatter(
+                fmt="[AL] %(levelname).1s %(name)s: %(message)s"
+            )
+        )
+        root_logger.addHandler(sh)
 
-    return logger
+    # AL パイプライン用の子ロガーを返す
+    return root_logger.getChild("pipelines.al")
 
 
 # ======================================================================
@@ -82,16 +102,30 @@ def _dump_exp_config(layout: ExperimentLayout, cfg: Mapping[str, Any]) -> None:
         yaml.safe_dump(dict(cfg), f, allow_unicode=True, sort_keys=False)
 
 
-def _dump_run_meta(layout: ExperimentLayout, cfg: Mapping[str, Any]) -> None:
-    """実行時メタ情報を JSON として保存する。"""
+def _dump_run_meta(
+    layout: ExperimentLayout,
+    cfg: Mapping[str, Any],
+    argv: Optional[List[str]] = None,
+) -> None:
+    """実行時メタ情報を JSON として保存する。
+
+    再現性向上のため、実行時のコマンドライン引数 (argv) も保存する。
+    """
     run_cfg = cfg.get("run", {})
-    run_id: Optional[str] = run_cfg.get("run_id")
+    experiment: Optional[str] = run_cfg.get("experiment")
+    run_name: Optional[str] = run_cfg.get("name")
 
     meta: Dict[str, Any] = {
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "run_id": run_id,
+        "started_at": datetime.now().astimezone().isoformat(),
+        "experiment": experiment,
+        "run_name": run_name,
+        "qid": cfg.get("data", {}).get("qid"),
         "out_dir": str(layout.root),
     }
+
+    if argv is not None:
+        # argv は JSON シリアライズしやすいように list[str] として保持
+        meta["argv"] = list(argv)
 
     path = layout.path_run_meta()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +165,7 @@ def _split_from_state(
     index: Mapping[Any, Mapping[str, Any]],
 ) -> DatasetSplit:
     """ALState の ID 集合から、DatasetSplit を再構築する。"""
+
     def _lookup(ids: Sequence[Any]):
         return [index[i] for i in ids if i in index]
 
@@ -177,13 +212,13 @@ def _append_al_history(
         "added": added,
         "coverage": f"{coverage:.6f}",
     }
-    
+
     # Task metrics をマージ (競合時は Task 優先)
     row = {**base_row, **metrics}
 
     file_exists = path.exists()
     fieldnames = list(row.keys())
-    
+
     with path.open("a", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
@@ -199,34 +234,78 @@ def _append_al_history(
 
 def run_experiment(
     cfg: Mapping[str, Any],
-    argv: Optional[List[str]] = None,  # CLI互換用 (未使用)
+    argv: Optional[List[str]] = None,  # CLI互換用 (未使用だが run_meta には保存)
 ) -> int:
     """
     Active Learning 実験を 1 本実行するメイン関数。
 
     Args:
         cfg: 実行設定 (YAMLロード済み)
-        argv: CLI引数 (cli.py から渡されるが本関数では cfg を優先するため未使用)
+        argv: CLI引数 (cli.py から渡される)
 
     Returns:
         int: 終了コード (0: 成功, 1: 失敗)
     """
+
+
+
+    # 0. 出力ディレクトリの構築と既存ディレクトリの扱い
+
+    # Config内の情報から、最終的な出力パスを決定
+    final_out_dir = ExperimentLayout.resolve_final_out_dir(cfg)
+
+    # Config の out_dir を強制的に上書き
+    if "run" not in cfg:
+        cfg["run"] = {}
+    cfg["run"]["out_dir"] = str(final_out_dir)
+
+    # 既存ディレクトリがあった場合の扱いを設定から決定
+    run_cfg = cfg.get("run", {})
+    on_exist_raw = run_cfg.get("on_exist", "overwrite")
+    on_exist = str(on_exist_raw).lower()
+
+    print(f"[AL] Target Output Directory: {final_out_dir}")
+    print(f"[AL] on_exist policy: {on_exist}")
+
+    if final_out_dir.exists():
+        if on_exist in ("skip", "ignore"):
+            print(f"[AL] Existing run directory found. Skipping: {final_out_dir}")
+            # 2 = skipped
+            return 2
+
+        if on_exist in ("error", "fail"):
+            print(f"[AL] ERROR: Output directory already exists: {final_out_dir}")
+            return 1
+
+        # デフォルト: overwrite
+        if on_exist not in ("overwrite", "replace"):
+            print(
+                f"[AL] WARN: Unknown on_exist='{on_exist_raw}', "
+                "falling back to 'overwrite'."
+            )
+
+        print(f"[AL] Found existing run directory. Removing: {final_out_dir}")
+        try:
+            shutil.rmtree(final_out_dir)
+        except Exception as e:
+            print(f"[AL] Failed to remove directory: {e}")
+            sys.exit(1)
+
+    final_out_dir.mkdir(parents=True, exist_ok=True)
+
+
     # 1) レイアウト構築 & ディレクトリ作成
     layout = ExperimentLayout.from_cfg(cfg)
     layout.ensure_all_dirs()
 
-    # 2) ロガー準備
+    # 2) ロガー準備（以降 tensaku.* のログは pipeline.log に集約される）
     logger = _setup_logger(layout.path_log_pipeline())
-    logger.info("=== Tensaku AL pipeline (Phase2) ===")
-    run_cfg = cfg.get("run", {})
-    run_id = run_cfg.get("run_id")
-    if run_id is not None:
-        logger.info("run_id = %s", run_id)
-    logger.info("out_dir = %s", layout.root)
 
     # 3) 設定 & メタ情報のダンプ
     _dump_exp_config(layout, cfg)
-    _dump_run_meta(layout, cfg)
+    _dump_run_meta(layout, cfg, argv=argv)
+
+    logger.info(f"Experiment Started in: {layout.root}")
 
     # 4) DatasetAdapter を構築し、初期 DatasetSplit を取得
     try:
@@ -259,10 +338,18 @@ def run_experiment(
     # 6) Task と Sampler を構築
     try:
         task: BaseTask = create_task(cfg=cfg, adapter=adapter, layout=layout)
-        logger.info("Task: %s (name=%s)", task.__class__.__name__, getattr(task, "name", "?"))
-        
+        logger.info(
+            "Task: %s (name=%s)",
+            task.__class__.__name__,
+            getattr(task, "name", "?"),
+        )
+
         sampler = create_sampler(cfg)
-        logger.info("Sampler: %s (name=%s)", sampler.__class__.__name__, getattr(sampler, "name", "?"))
+        logger.info(
+            "Sampler: %s (name=%s)",
+            sampler.__class__.__name__,
+            getattr(sampler, "name", "?"),
+        )
     except Exception:
         logger.exception("Task or Sampler initialization failed.")
         return 1
@@ -270,12 +357,20 @@ def run_experiment(
     al_cfg = cfg.get("al", {})
     rounds = int(al_cfg.get("rounds", 1))
     budget = int(al_cfg.get("budget", 0))
+
+    # 停止条件: pool が空になったら止めるか？
+    stop_when_pool_empty = bool(al_cfg.get("stop_when_pool_empty", True))
+
     logger.info("AL rounds = %d, budget per round = %d", rounds, budget)
+    if stop_when_pool_empty:
+        logger.info("AL stop condition: stop_when_pool_empty=True")
+
 
     # 7) ラウンドループ
+    last_round_executed: Optional[int] = None
     for r in range(rounds):
         logger.info("=== [round %d] ===", r)
-        
+
         # (a) Task 実行
         split_r = _split_from_state(state, index)
         try:
@@ -311,7 +406,7 @@ def run_experiment(
             round_index=r, 
             prev_state=state, 
             new_state=new_state, 
-            metrics=out.metrics
+            metrics=out.metrics,
         )
         
         # 選択されたIDの保存
@@ -322,7 +417,39 @@ def run_experiment(
                 for sid in selected_ids:
                     f.write(f"{sid}\n")
 
+        # 次ラウンド用の状態更新
         state = new_state
+        last_round_executed = r
+
+        # 停止条件: pool が空になったら終了
+        if stop_when_pool_empty and state.n_pool == 0:
+            logger.info(
+                "  Stop condition met: pool is empty (n_pool=0). "
+                "Terminating AL loop at round %d.",
+                r,
+            )
+            break
+
+
+    # 8) 最終ラウンドの preds_detail / gate_assign を final にコピー
+    if last_round_executed is not None:
+        last_round = last_round_executed
+        src_detail = layout.path_predictions_round_detail(last_round)
+        src_assign = layout.path_predictions_round_gate_assign(last_round)
+
+
+        # preds_detail.csv
+        if src_detail.exists():
+            dst_detail = layout.path_predictions_final_detail()
+            dst_detail.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src_detail, dst_detail)
+            logger.info("Copied final predictions to %s", dst_detail)
+
+        # gate_assign.csv (もしあれば)
+        if src_assign.exists():
+            dst_assign = layout.path_predictions_final_gate_assign()
+            shutil.copy(src_assign, dst_assign)
+            logger.info("Copied final gate assignments to %s", dst_assign)
 
     logger.info("AL pipeline finished successfully.")
     return 0

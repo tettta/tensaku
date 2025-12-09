@@ -40,7 +40,7 @@ import numpy as np
 
 # ---- Registry（任意依存：無ければno-op） -----------------------------------------------------------
 try:
-    from .registry import register  # type: ignore
+    from tensaku.registry import register  # type: ignore
 except Exception:  # pragma: no cover
     def register(name: str, **_kw):
         def _decor(x): return x
