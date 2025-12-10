@@ -1,0 +1,14 @@
+qid: "Y14_1-2_1_3"  # デフォルト値
+# パス補間: 同じファイル内の変数 qid を参照
+base_dir: "data_sas/splits/${.qid}"
+
+input_all: "data_sas/all.jsonl"
+files:
+  labeled: labeled.jsonl
+  dev: dev.jsonl
+  test: test.jsonl
+  pool: pool.jsonl
+text_key_primary: mecab
+label_key: score
+id_key: id
+max_len: 128

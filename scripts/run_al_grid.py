@@ -77,36 +77,87 @@ class ExperimentConfig:
 # QID ごとにまとめて分析したいので、最上位ループは QIDS。
 QIDS: List[str] = [
     "Y14_1-2_1_3",
+    "Y14_1-2_1_3", 
+    #"Y14_1-2_1_3.sub", 
+    "Y14_1-2_2_4", 
+    #"Y14_1-2_2_4.sub", 
+    "Y14_2-1_1_5", 
+    #"Y14_2-1_1_5.sub", 
+    "Y14_2-1_2_3", 
+    #"Y14_2-1_2_3.sub", 
+    "Y14_2-2_1_4", 
+    #"Y14_2-2_1_4.sub", 
+    "Y14_2-2_2_3", 
+    "Y14_2-2_2_3.sub", 
+    #"Y15_1-1_1_4.0", 
+    #"Y15_1-1_1_4.1", 
+    #"Y15_1-1_1_6.0", 
+    #"Y15_1-1_1_6.1", 
+    #"Y15_1-3_1_2.0", 
+    #"Y15_1-3_1_2.1", 
+    #"Y15_1-3_1_5.0", 
+    #"Y15_1-3_1_5.1", 
+    #"Y15_2-2_1_3.0,",
+    #"Y15_2-2_1_3.1", 
+    #"Y15_2-2_1_5.0", 
+    #"Y15_2-2_1_5.1", 
+    #"Y15_2-2_2_4.0", 
+    #"Y15_2-2_2_4.1", 
+    #"Y15_2-2_2_5.0", 
+    #"Y15_2-2_2_5.1", 
+    #"Y15_2-3_1_5", 
+    #"Y15_2-3_2_2", 
+    #"Y15_2-3_2_4", 
     # 必要なら他の qid を追加
 ]
 
 # 各 experiment 内で回す seed のリスト。
-SEEDS: List[int] = [42]
+SEEDS: List[int] = [42, 43, 44]
 
 # 「比較したい設定」は experiment 名に埋め込み、
 # 必要な override はここで指定する。
 EXPERIMENT_CONFIGS = [
     # trust を使う uncertainty sampling
     ExperimentConfig(
-        name="exp_trust",
+        name="al_trustv2_b50",
         overrides={
             "al.sampler.name": "uncertainty",
             "al.uncertainty_key": "trust",
+            "al.budget": 50,
         },
     ),
     # MSP を使う uncertainty sampling
     ExperimentConfig(
-        name="exp_msp",
+        name="al_msp_b50",
         overrides={
             "al.sampler.name": "uncertainty",
             "al.uncertainty_key": "msp",
+            "al.budget": 50,
+        },
+    ),
+    # K-means を使う  sampling
+    ExperimentConfig(
+        name="al_kmeans_b50",
+        overrides={
+            "al.sampler.name": "k-means",
+            "al.budget": 50,
+        },
+    ),
+    # Hybrid を使う  sampling
+    ExperimentConfig(
+        name="al_hyb-trustv2-random_b50",
+        overrides={
+            "al.sampler.name": "hybrid",
+            "al.uncertainty_key": "trust",
+            "al.budget": 50,
         },
     ),
     # 純ランダム sampling
     ExperimentConfig(
-        name="exp_random",
+        name="al_random_b50",
         overrides={
             "al.sampler.name": "random",
+            "al.budget": 50,
         },
     ),
 ]
@@ -115,8 +166,8 @@ EXPERIMENT_CONFIGS = [
 
 # al.rounds / al.budget を CLI から上書きしたい場合に設定する。
 # YAML 側で管理したい場合は None にしておけば CLI では触らない。
-AL_ROUNDS: Optional[int] = 5
-AL_BUDGET: Optional[int] = 50
+AL_ROUNDS: Optional[int] = None
+AL_BUDGET: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------

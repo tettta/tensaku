@@ -1,0 +1,8 @@
+defaults:
+  - sampler: random
+  - _self_
+
+rounds: 30
+budget: 50
+stop_when_pool_empty: true
+seed: 42

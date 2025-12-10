@@ -71,26 +71,6 @@ class ExperimentLayout:
             current = current[key]
         return str(current)
     
-    @classmethod
-    def resolve_final_out_dir(cls, cfg: Mapping[str, Any]) -> Path:
-        """設定 (cfg) に基づき、ExperimentLayout のルートとなる最終出力パスを決定する。
-
-        構造: ./outputs / QID / EXPERIMENT / RUN_NAME
-        """
-        run_cfg = cfg.get("run", {})
-        
-        # 必要な3つのコンポーネントを取得
-        qid = cls._get_config_value(cfg, 'data.qid', 'default_qid')
-        experiment_name = cls._get_config_value(cfg, 'run.experiment', 'default_exp')
-        run_name = cls._get_config_value(cfg, 'run.name', 'default_run')
-
-        # ベースディレクトリ (相対パス ./outputs を使用)
-        root_dir = Path("./outputs")
-        
-        # 階層構造を構築
-        final_out_dir = root_dir / qid / experiment_name / run_name
-        
-        return final_out_dir
 
     @classmethod
     def from_cfg(cls, cfg: Mapping[str, Any]) -> "ExperimentLayout":
@@ -352,6 +332,15 @@ class ExperimentLayout:
         """
         safe_name = name.lstrip("_")
         return self.arrays_rounds_dir / f"{self.round_name(round_index)}_{safe_name}"
+    
+
+    def path_arrays_round_pool_embs(self, round_index: int) -> Path:
+        infer_dir = self.path_rounds_infer_dir(round_index)
+        return infer_dir / "pool_embs.npy"
+
+    def path_arrays_round_pool_preds(self, round_index: int) -> Path:
+        infer_dir = self.path_rounds_infer_dir(round_index)
+        return infer_dir / "pool_preds.csv"
 
     # ------------------------------------------------------------------
     # plots

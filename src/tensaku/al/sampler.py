@@ -90,7 +90,12 @@ class RandomSampler(BaseSampler):
         # seed が指定されていれば再現可能
         self._rng.shuffle(pool_ids)
         
-        return pool_ids[:budget]
+        selected = pool_ids[:budget]
+
+        # ★追加: ログ出力
+        LOGGER.info(f"[RandomSampler] Selected {len(selected)} samples randomly.")
+
+        return selected
 
 
 @dataclass
@@ -141,6 +146,10 @@ class UncertaintySampler(BaseSampler):
         
         # 上位 budget 件を選択
         selected_ids = [item[0] for item in sorted_items[:budget]]
+
+        # ★追加: ログ出力
+        LOGGER.info(f"[UncertaintySampler] Selected {len(selected_ids)} samples (Strategy: {self.strategy}).")
+
         return selected_ids
 
 
@@ -153,6 +162,8 @@ class ClusteringSampler(BaseSampler):
     name: str = "clustering"
     out_dir: str = ""       # ExperimentLayout 構築用
     k: Optional[int] = None # クラスタ数 (Noneなら budget と同じ)
+
+    # /home/esakit25/work/tensaku/src/tensaku/al/sampler.py (ClusteringSampler.select内)
 
     def select(
         self,
@@ -174,16 +185,19 @@ class ClusteringSampler(BaseSampler):
 
         # 前ラウンド (round_index - 1) の推論結果パスを特定
         prev_round = state.round_index - 1
-        layout = ExperimentLayout(cfg={"run": {"out_dir": self.out_dir}})
-        # ExperimentLayout の API に従いパスを解決 (inferディレクトリ想定)
-        # infer_pool.py は rounds/round_XXX/infer/pool_embs.npy に出力している
-        infer_dir = layout.root / "rounds" / f"round_{prev_round:03d}" / "infer"
+        layout = ExperimentLayout.from_cfg(cfg={"run": {"out_dir": self.out_dir}})
         
-        pool_embs_path = infer_dir / "pool_embs.npy"
-        pool_preds_path = infer_dir / "pool_preds.csv"
+        # ExperimentLayout の API に従いパスを解決 (inferディレクトリ想定)
+        # ★修正1: infer_dir のパス構築を layout API に任せる
+        infer_dir = layout.path_rounds_infer_dir(prev_round)
+        
+        # ★修正2: pool_embs.npy と pool_preds.csv のパス決定を layout API に任せる
+        pool_embs_path = layout.path_arrays_round_pool_embs(prev_round)
+        pool_preds_path = layout.path_arrays_round_pool_preds(prev_round)
 
         try:
             if not pool_embs_path.exists() or not pool_preds_path.exists():
+                # エラーメッセージをより具体的なパスに更新 (infer_dirは parent() で取得)
                 raise FileNotFoundError(f"Embeddings or preds not found in {infer_dir}")
 
             # データのロード
@@ -221,6 +235,9 @@ class ClusteringSampler(BaseSampler):
         if n_clusters <= 0:
             return []
 
+        # ★追加: ログ出力
+        LOGGER.info(f"[ClusteringSampler] Running KMeans (k={n_clusters}) on {len(target_embs)} samples.")
+
         kmeans = KMeans(
             n_clusters=n_clusters, 
             random_state=self.seed, 
@@ -230,7 +247,6 @@ class ClusteringSampler(BaseSampler):
         kmeans.fit(target_embs)
         
         # 各クラスタの中心に最も近いサンプルを選択
-        # transform は各クラスタ中心までの距離を返す (N, n_clusters)
         distances = kmeans.transform(target_embs)
         selected_ids: List[Any] = []
         
@@ -248,8 +264,11 @@ class ClusteringSampler(BaseSampler):
             selected_ids.append(target_ids[min_idx_absolute])
         
         # 重複排除して budget 件まで返す
-        # (通常 K-Means では重複しないが念のため)
         unique_selected = list(dict.fromkeys(selected_ids))
+
+        # ログ出力
+        LOGGER.info(f"[ClusteringSampler] Selected {len(unique_selected)} samples.")
+
         return unique_selected[:budget]
 
 
@@ -266,6 +285,7 @@ class HybridSampler(BaseSampler):
     sub_budget_ratio: float = 5.0  # 候補集合のサイズ倍率
     k_cluster: Optional[int] = None
 
+
     def select(
         self,
         state: ALState,
@@ -280,7 +300,6 @@ class HybridSampler(BaseSampler):
             return []
             
         # 1. 不確実性による候補絞り込み
-        #    scores が無い場合は Hybrid は成立しない -> Random へ
         if scores is None:
             LOGGER.warning("[HybridSampler] Scores is None. Fallback to Random.")
             return RandomSampler(seed=self.seed).select(state, scores, budget)
@@ -289,6 +308,9 @@ class HybridSampler(BaseSampler):
             int(budget * self.sub_budget_ratio), 
             state.n_pool
         )
+
+        # ★追加: ログ出力 (Step 1)
+        LOGGER.info(f"[HybridSampler] Step 1: Uncertainty filtering. Select {candidate_budget} candidates from {state.n_pool} pool items.")
         
         # UncertaintySampler を委譲利用
         u_sampler = UncertaintySampler(seed=self.seed, strategy=self.uncertainty_strategy)
@@ -298,21 +320,31 @@ class HybridSampler(BaseSampler):
             return []
 
         # 2. 候補集合 (candidate_ids) に対してクラスタリング
-        #    ClusteringSampler のロジックを再利用したいが、対象 ID が全 pool ではなく
-        #    candidate_ids に限定されるため、同様のロジックをここで実行する。
         
         round_index = state.round_index
         if round_index == 0:
             # Round 0 は埋め込みがないため、Uncertainty の結果をそのまま返す (Top-K)
+            LOGGER.info("[HybridSampler] Round 0: No embeddings. Returning Top-K candidates.")
             return candidate_ids[:budget]
 
         prev_round = round_index - 1
-        layout = ExperimentLayout(cfg={"run": {"out_dir": self.out_dir}})
-        infer_dir = layout.root / "rounds" / f"round_{prev_round:03d}" / "infer"
-        pool_embs_path = infer_dir / "pool_embs.npy"
-        pool_preds_path = infer_dir / "pool_preds.csv"
+        layout = ExperimentLayout.from_cfg(cfg={"run": {"out_dir": self.out_dir}})
+        
+        # ★修正1: layout API を使用して infer_dir のパスを取得
+        infer_dir = layout.path_rounds_infer_dir(prev_round)
+        
+        # ★修正2: layout API を使用してファイルパスを決定
+        pool_embs_path = layout.path_arrays_round_pool_embs(prev_round)
+        pool_preds_path = layout.path_arrays_round_pool_preds(prev_round)
 
         try:
+            # pool_embs.npy と pool_preds.csv は infer ディレクトリ直下に存在することを期待
+            if not pool_embs_path.exists() or not pool_preds_path.exists():
+                # エラーメッセージをより具体的なパスに更新
+                raise FileNotFoundError(
+                    f"Embeddings or preds not found. Expected dir: {infer_dir}"
+                )
+                
             pool_embs = np.load(pool_embs_path)
             df_preds = pd.read_csv(pool_preds_path)
             
@@ -345,6 +377,9 @@ class HybridSampler(BaseSampler):
         if n_clusters <= 0:
             return []
 
+        # ★追加: ログ出力 (Step 2)
+        LOGGER.info(f"[HybridSampler] Step 2: Running KMeans (k={n_clusters}) on {len(target_embs)} candidates.")
+
         kmeans = KMeans(
             n_clusters=n_clusters, 
             random_state=self.seed, 
@@ -367,6 +402,10 @@ class HybridSampler(BaseSampler):
             selected_ids.append(target_ids[min_idx_abs])
             
         unique_selected = list(dict.fromkeys(selected_ids))
+
+        # ★追加: ログ出力 (Final)
+        LOGGER.info(f"[HybridSampler] Selected {len(unique_selected)} samples.")
+
         return unique_selected[:budget]
 
 
@@ -400,8 +439,41 @@ def _factory_uncertainty_sampler(
     strat = sampler_cfg.get("uncertainty_strategy", "least_confidence")
     return UncertaintySampler(seed=seed, strategy=strat)
 
+@register_sampler("trust")
+def _factory_trust_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """Trustサンプリング (実体は UncertaintySampler + strategy='trust')"""
+    # strategy を固定して UncertaintySampler を返す
+    return UncertaintySampler(seed=seed, strategy="trust")
 
-@register_sampler("clustering")
+
+@register_sampler("msp")
+def _factory_msp_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """MSPサンプリング"""
+    return UncertaintySampler(seed=seed, strategy="msp")
+
+
+@register_sampler("entropy")
+def _factory_entropy_sampler(
+    *,
+    cfg: Mapping[str, Any],
+    sampler_cfg: Mapping[str, Any],
+    seed: Optional[int] = None,
+) -> BaseSampler:
+    """Entropyサンプリング"""
+    return UncertaintySampler(seed=seed, strategy="entropy")
+
+
+@register_sampler("kmeans")
 def _factory_clustering_sampler(
     *,
     cfg: Mapping[str, Any],

@@ -1,0 +1,8 @@
+label_key: score
+seed: ${run.seed}
+stratify: true
+mode: n_train
+n_train: 50
+ratio:
+  test: 0.15
+  dev: 0.15

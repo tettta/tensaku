@@ -1,0 +1,14 @@
+# configs/confidence/trust_v2.yaml
+
+estimators:
+  # 1. 基本的な推定器 (パラメータなし)
+  - name: msp
+  - name: entropy
+  
+  - name: trust
+    version: v2
+    metric: cosine
+    k_list: [5]
+    agg: median
+    trim_q: 0.1
+    normalize: zscore

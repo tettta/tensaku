@@ -1,0 +1,7 @@
+name: "trust"
+version: v2
+metric: cosine
+k_list: [5]
+agg: median
+trim_q: 0.1
+normalize: zscore

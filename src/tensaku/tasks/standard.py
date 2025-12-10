@@ -27,7 +27,20 @@ from tensaku.train import train_core
 from tensaku.infer_pool import infer_core
 from tensaku.pipelines.hitl import run_hitl_from_detail_df
 
+from tensaku.utils.cleaner import cleanup_round_immediate
+
 LOGGER = logging.getLogger(__name__)
+
+def resolve_conf_column_name(key: str) -> str:
+    """
+    短いキー名 (例: "trust", "msp") から DataFrame の具体的な列名 (例: "conf_trust") を生成する。
+    
+    このユーティリティにより、静的な CONF_KEY_TO_COLUMN_NAME 定義が不要となる。
+    """
+    if not key:
+        raise ValueError("Confidence key cannot be empty.")
+        
+    return f"conf_{key.lower()}"
 
 
 class StandardSupervisedAlTask(TrainInferHitlTask):
@@ -44,16 +57,13 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
         # ステップ間データ受け渡し用ステート
         self._current_data_dir: Optional[Path] = None
         self._current_train_out_dir: Optional[Path] = None
-        # ★修正1: _cleanup_round_files 実行時のエラーに対応
+        
         self._current_infer_out_dir: Optional[Path] = None 
         
         self._current_model: Optional[Any] = None
         self._current_preds_df: Optional[pd.DataFrame] = None
 
         self._current_raw_outputs: Optional[Any] = None
-        # クリーンアップ対象の拡張属性（必要に応じてサブクラスが使う）
-        self._extra_cleanup_dirs: List[Path] = []
-        self._extra_cleanup_files: List[Path] = []
 
         # 現在のラウンド番号（クリーンアップ用）
         self._current_round_index: Optional[int] = None
@@ -66,18 +76,14 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
 
     def run_round(self, round_index: int, split: DatasetSplit) -> TaskOutputs:
         """
-        クリーンアップ処理を追加したラッパー。
+        内部生成物（Checkpoints, Temp）のみタスク終了時に即時削除する。
+        npy はサンプラーのために残す。
         """
-        # ラウンドごとにクリーンアップ対象をリセットし、現在ラウンドを記録
-        self._extra_cleanup_dirs = []
-        self._extra_cleanup_files = []
-        self._current_round_index = round_index
-
         try:
             return super().run_round(round_index, split)
         finally:
-            self._cleanup_round_files()
-            self._current_round_index = None
+            # ここでは「サンプラーが絶対に使わないもの」だけを消す
+            cleanup_round_immediate(self.cfg, self.layout, round_index)
 
 
 
@@ -156,6 +162,33 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
         self._current_infer_out_dir = Path(out_dir)
         self._current_preds_df = preds_df
         self._current_raw_outputs = raw_outputs
+        
+        # 4. Samplerが次ラウンドで参照する埋め込みとIDリストを明示的に保存 (layout APIを使用)
+        
+        # pool_embs.npy の保存
+        if raw_outputs and "pool" in raw_outputs and "embs" in raw_outputs["pool"]:
+            embs = raw_outputs["pool"]["embs"]
+            # ★修正: layout API を使用してパスを取得
+            embs_path = self.layout.path_arrays_round_pool_embs(round_index)
+            try:
+                embs_path.parent.mkdir(parents=True, exist_ok=True) # 親ディレクトリを確保
+                np.save(embs_path, embs)
+                LOGGER.info(f"Saved pool embeddings for sampler to: {embs_path}")
+            except Exception as e:
+                LOGGER.error(f"Failed to save pool_embs.npy: {e}")
+
+        # pool_preds.csv の保存 (IDの整合性確認用)
+        if preds_df is not None and not preds_df.empty:
+            pool_df = preds_df[preds_df["split"] == "pool"].copy()
+            if not pool_df.empty:
+                # ★修正: layout API を使用してパスを取得
+                preds_path = self.layout.path_arrays_round_pool_preds(round_index)
+                try:
+                    preds_path.parent.mkdir(parents=True, exist_ok=True) # 親ディレクトリを確保
+                    pool_df[["id"]].to_csv(preds_path, index=False)
+                    LOGGER.info(f"Saved pool preds ID list for sampler to: {preds_path}")
+                except Exception as e:
+                    LOGGER.error(f"Failed to save pool_preds.csv: {e}")
         
 
     def step_confidence(self, round_index: int, split: DatasetSplit) -> None:
@@ -274,50 +307,126 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
     
 
     def step_hitl(self, round_index: int, split: DatasetSplit) -> TaskOutputs:
-        """予測結果に基づき HITL 判定を行い、Metrics と Pool Scores を返すステップ。"""
+        """指定ラウンドの予測結果に対し、HITLゲート処理と評価を行う。"""
         LOGGER.info(f"[{self.name}] step_hitl (round={round_index})")
+
+        # 0. 前提データのロード
+        path_detail = self.layout.path_predictions_round_detail(round_index)
+        if not path_detail.exists():
+            LOGGER.warning("preds_detail.csv not found at %s. Skipping HITL.", path_detail)
+            return TaskOutputs(metrics={}, pool_scores={})
+
+        df = pd.read_csv(path_detail)
         
-        df = self._current_preds_df
-        if df is None:
-            raise RuntimeError("Predictions df is missing in step_hitl")
+        if df.empty:
+             return TaskOutputs(metrics={}, pool_scores={})
 
-        # 1. HITL判定の実行 (計算のみ)
-        hitl_out = run_hitl_from_detail_df(df, self.cfg)
+        # 1. HITL/レポート用の確信度キーの解決
+        # 優先順位: gate.conf_key > run.conf_key > "trust" (デフォルト)
+        gate_cfg = self.cfg.get("gate", {})
+        run_cfg = self.cfg.get("run", {})
+        
+        report_conf_key = gate_cfg.get("conf_key") or run_cfg.get("conf_key") or "trust"
+        conf_column_name = resolve_conf_column_name(report_conf_key)
+
+        # レポート用スコア列の存在確認
+        if conf_column_name not in df.columns:
+            # KMeansなどの場合、信頼度スコアが計算されていない可能性がある。
+            # エラーではなく警告を出し、HITL計算をスキップしてサンプリングへ進む。
+            LOGGER.warning(
+                f"[HITL] Reporting confidence column '{conf_column_name}' (key='{report_conf_key}') "
+                f"not found in DataFrame. Skipping HITL metrics."
+            )
+            # HITL結果は空、PoolScoresのみ取得して返す
+            return TaskOutputs(metrics={}, pool_scores=self._get_pool_scores(df, round_index))
+
+        # 2. HITLパイプラインの実行
+        try:
+            # 純粋な関数として呼び出し (列名マッピングは完了済み)
+            hitl_out = run_hitl_from_detail_df(
+                df=df,
+                gate_cfg=gate_cfg,
+                conf_column_name=conf_column_name,
+            )
+        except Exception as e:
+            LOGGER.error("HITL pipeline failed: %s", e)
+            # パイプライン失敗時もサンプリングは続行できるよう空metricsで返す
+            return TaskOutputs(metrics={}, pool_scores=self._get_pool_scores(df, round_index))
+
+        # 3. 結果の処理 (Summary / Assignments)
         metrics = hitl_out.to_summary_dict()
-
-        # ★修正2: gate_assign.csv の保存
+        
+        # gate_assign.csv の保存
         self._save_gate_assign(round_index, df, hitl_out)
 
-        # 2. Poolスコア抽出（AL 用の conf_key を解決）
-        pool_scores: Dict[Any, float] = {}
-
-        conf_key_short = self._resolve_al_conf_key(hitl_out)
-        target_col = f"conf_{conf_key_short}"
-
-        # conf_key がそのまま列名の場合も考慮 (例: conf_trust, trust, etc.)
-        if target_col not in df.columns:
-            if conf_key_short in df.columns:
-                target_col = conf_key_short
-            else:
-                LOGGER.warning(
-                    f"[{self.name}] AL conf column not found "
-                    f"(conf_key={conf_key_short}, target_col={target_col}). "
-                    f"Available columns: {list(df.columns)}"
-                )
-                return TaskOutputs(metrics=metrics, pool_scores=pool_scores)
-
-        pool_df = df[df["split"] == "pool"]
-        if not pool_df.empty:
-            pool_scores = dict(zip(pool_df["id"], pool_df[target_col]))
-
+        # 4. Pool Scores の準備 (Samplingとは別ロジック)
+        pool_scores = self._get_pool_scores(df, round_index)
+        
         return TaskOutputs(metrics=metrics, pool_scores=pool_scores)
+    
+    
+    def _get_pool_scores(self, df: pd.DataFrame, round_index: int) -> Dict[Any, float]:
+        """
+        AL Sampler のために Pool データからスコアを抽出する。
+        
+        Returns:
+            Dict[Any, float]: {データID: スコア} の辞書。
+        """
+        pool_df = df[df["split"] == "pool"]
+        if pool_df.empty:
+            return {}
 
+        # サンプラー設定の確認
+        al_cfg = self.cfg.get("al", {})
+        sampler_cfg = al_cfg.get("sampler", {})
+        sampler_name = str(sampler_cfg.get("name", "random")).lower()
+
+        # 確信度を使わないサンプラー (Random, KMeans等) はスコア抽出不要
+        if sampler_name in ["random", "kmeans", "clustering", "hybrid"]:
+            LOGGER.info(
+                f"[PoolScores] Sampler '{sampler_name}' does not require uncertainty scores. "
+                "Skipping score extraction."
+            )
+            return {}
+        
+        # 確信度サンプラーの場合、使用するキーを決定
+        # 優先順位: al.sampler.conf_key > gate.conf_key > run.conf_key > "trust"
+        gate_cfg = self.cfg.get("gate", {})
+        run_cfg = self.cfg.get("run", {})
+        
+        sampler_key = (
+            sampler_cfg.get("conf_key")
+            or gate_cfg.get("conf_key")
+            or run_cfg.get("conf_key")
+            or "trust"
+        )
+        
+        # 列名を解決
+        score_column_name = resolve_conf_column_name(sampler_key)
+
+        pool_scores: Dict[Any, float] = {}
+        
+        if score_column_name in pool_df.columns:
+            # ID と Score のマッピングを作成
+            # ※ id列が無い場合は index を使うなどのフォールバックがあっても良いが、
+            #    ここでは id 列必須の前提とする
+            if "id" in pool_df.columns:
+                pool_scores = dict(zip(pool_df["id"], pool_df[score_column_name]))
+                LOGGER.info(f"[PoolScores] Extracted {len(pool_scores)} scores from '{score_column_name}' for sampling.")
+            else:
+                LOGGER.warning("[PoolScores] 'id' column missing in pool dataframe. Cannot map scores.")
+        else:
+            LOGGER.warning(
+                f"[PoolScores] Score column '{score_column_name}' (key='{sampler_key}') not found. "
+                f"Uncertainty sampling '{sampler_name}' may fail or behave like Random."
+            )
+
+        return pool_scores
 
     # =============================================================================
     # ヘルパーメソッド
     # =============================================================================
 
-    # ★修正3: _write_jsonl をクラス内に移動 (AttributeError: '_write_jsonl' の修正)
     def _write_jsonl(self, path: Path, records: List[Any]) -> None:
         """リスト of dict/dataclass を JSONL 形式でファイルに書き出すヘルパー。"""
         with open(path, "w", encoding="utf-8") as f:
@@ -335,73 +444,7 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
         if new_infer: cloned["infer"].update(new_infer)
         return cloned
 
-
-    def _cleanup_round_files(self) -> None:
-        """
-        ラウンド終了後に不要なファイル/ディレクトリを削除し、ディスク容量を節約する。
-        run.cleanup_* の設定に応じて挙動を制御する。
-        """
-        run_cfg = self.cfg.get("run", {}) if isinstance(self.cfg.get("run", {}), Mapping) else {}
-
-        cleanup_ckpt = bool(run_cfg.get("cleanup_round_checkpoints", False))
-        cleanup_arrays = bool(run_cfg.get("cleanup_round_arrays", False))
-        cleanup_temp = bool(run_cfg.get("cleanup_round_temp", False))
-        cleanup_infer_npy = bool(run_cfg.get("cleanup_round_infer_npy", False))
-
-        # 1. infer で生成された raw output (.npyファイル) を削除
-        if cleanup_infer_npy and self._current_infer_out_dir and self._current_infer_out_dir.exists():
-            for p in self._current_infer_out_dir.glob("*.npy"):
-                try:
-                    p.unlink()
-                    LOGGER.debug(f"Cleanup: Removed infer npy file {p}")
-                except OSError as e:
-                    LOGGER.warning(f"Cleanup: Failed to remove infer npy {p}: {e}")
-
-        # 2. train で生成されたモデルチェックポイント (.ptファイル) ディレクトリを削除
-        if cleanup_ckpt and self._current_train_out_dir is not None:
-            ckpt_dir = self._current_train_out_dir / "checkpoints_min"
-            if ckpt_dir.exists():
-                try:
-                    shutil.rmtree(ckpt_dir)
-                    LOGGER.debug(f"Cleanup: Removed checkpoint dir {ckpt_dir}")
-                except OSError as e:
-                    LOGGER.warning(f"Cleanup: Failed to remove checkpoint dir {ckpt_dir}: {e}")
-
-        # 3. arrays/rounds/round_xxx_*.npy を削除
-        if cleanup_arrays and self._current_round_index is not None:
-            try:
-                round_name = self.layout.round_name(self._current_round_index)
-                arrays_dir = self.layout.arrays_rounds_dir
-                if arrays_dir.exists():
-                    prefix = f"{round_name}_"
-                    for p in arrays_dir.glob(f"{prefix}*.npy"):
-                        try:
-                            p.unlink()
-                            LOGGER.debug(f"Cleanup: Removed arrays npy file {p}")
-                        except OSError as e:
-                            LOGGER.warning(f"Cleanup: Failed to remove arrays npy {p}: {e}")
-            except Exception as e:
-                LOGGER.warning(f"Cleanup: arrays removal failed: {e}")
-
-        # 4. temp_data/round_xxx/ を削除
-        if cleanup_temp and self._current_round_index is not None:
-            try:
-                temp_dir = self.layout.path_temp_round_dir(self._current_round_index)
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir)
-                    LOGGER.debug(f"Cleanup: Removed temp_data dir {temp_dir}")
-            except OSError as e:
-                LOGGER.warning(f"Cleanup: Failed to remove temp_data dir {temp_dir}: {e}")
-
-        # 5. 追加で登録されたディレクトリも削除（サブクラス拡張用）
-        for p in self._extra_cleanup_dirs:
-            if p.exists():
-                try:
-                    shutil.rmtree(p)
-                    LOGGER.debug(f"Cleanup: Removed extra dir {p}")
-                except OSError as e:
-                    LOGGER.warning(f"Cleanup: Failed to remove extra dir {p}: {e}")
-
+                    
 
     def _resolve_al_conf_key(self, hitl_out: Any) -> str:
         """
@@ -477,3 +520,6 @@ class StandardSupervisedAlTask(TrainInferHitlTask):
             LOGGER.info(f"Saved gate assignment to: {save_path}")
         else:
             LOGGER.warning("No gate assignments generated.")
+
+
+

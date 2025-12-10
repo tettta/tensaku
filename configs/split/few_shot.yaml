@@ -1,0 +1,5 @@
+defaults:
+  - standard
+  - _self_
+
+n_train: 10

@@ -1,0 +1,4 @@
+# configs/task/standard_supervised.yaml
+
+name: sas_total_score
+# タスク固有のパラメータがあればここに書く

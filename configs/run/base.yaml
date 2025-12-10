@@ -1,0 +1,9 @@
+seed: 42
+
+on_exist: skip # skip | overwrite | error
+save_logits: true
+save_predictiions: true
+
+# プレースホルダー (Pythonコードで注入される)
+data_dir: null
+out_dir: null

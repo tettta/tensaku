@@ -23,6 +23,7 @@ import shutil
 
 import yaml  # PyYAML
 
+from tensaku.utils.cleaner import cleanup_round_delayed, cleanup_post_experiment
 from tensaku.experiments.layout import ExperimentLayout
 from tensaku.data.base import DatasetSplit, create_adapter
 from tensaku.tasks.base import BaseTask, TaskOutputs, create_task
@@ -31,62 +32,33 @@ from tensaku.al.sampler import create_sampler
 from tensaku.al.loop import run_one_step
 
 
-# パッケージルートのロガー名
-LOGGER_NAME = "tensaku"
-# パイプライン用モジュールロガー
-LOGGER = logging.getLogger(f"{LOGGER_NAME}.pipelines.al")
-
-
-
 # ======================================================================
-# ロガー
+# ロガー (Hydra対応版)
 # ======================================================================
 
-
-def _setup_logger(log_path: Path, verbose: bool = True) -> logging.Logger:
-    """パイプライン全体のロガーをセットアップする。
-
-    - パッケージルートロガー "tensaku" にハンドラをぶら下げる。
-    - 各モジュールの LOGGER = logging.getLogger(__name__) からのログも
-      同じフォーマットで pipeline.log に集約される。
+def _setup_logger(verbose: bool = True) -> logging.Logger:
     """
-
-    # ルートロガー（パッケージ単位）を構成
-    root_logger = logging.getLogger(LOGGER_NAME)
-    root_logger.setLevel(logging.INFO)
-    root_logger.propagate = False
-
-    # 既存ハンドラがあれば一旦クリア
-    if root_logger.handlers:
-        for h in list(root_logger.handlers):
-            h.close()
-            root_logger.removeHandler(h)
-
-    # ログ出力先ディレクトリを確保
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    # ファイルハンドラ: 実験再現用のフルログ
-    fh = logging.FileHandler(log_path, mode="w", encoding="utf-8")
-    fh.setFormatter(
-        logging.Formatter(
-            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-    )
-    root_logger.addHandler(fh)
-
-    # コンソールハンドラ: 進捗確認用（必要に応じて無効化も可能）
+    パイプライン用のロガーをセットアップする。
+    
+    Note:
+        Hydraが既に root ロガーに対して FileHandler (main.log) と 
+        StreamHandler (コンソール) を設定しているため、
+        ここでは独自にハンドラを追加せず、ログレベルの調整のみを行う。
+        これによりログの二重出力を防ぐ。
+    """
+    # パッケージルートのロガー名
+    LOGGER_NAME = "tensaku"
+    
+    # パイプライン用モジュールロガーを取得
+    logger = logging.getLogger(f"{LOGGER_NAME}.pipelines.al")
+    
+    # ログレベルを設定
     if verbose:
-        sh = logging.StreamHandler(sys.stdout)
-        sh.setFormatter(
-            logging.Formatter(
-                fmt="[AL] %(levelname).1s %(name)s: %(message)s"
-            )
-        )
-        root_logger.addHandler(sh)
+        logger.setLevel(logging.INFO)
+    else:
+        logger.setLevel(logging.WARNING)
 
-    # AL パイプライン用の子ロガーを返す
-    return root_logger.getChild("pipelines.al")
+    return logger
 
 
 # ======================================================================
@@ -234,74 +206,40 @@ def _append_al_history(
 
 def run_experiment(
     cfg: Mapping[str, Any],
-    argv: Optional[List[str]] = None,  # CLI互換用 (未使用だが run_meta には保存)
+    argv: Optional[List[str]] = None,
 ) -> int:
     """
-    Active Learning 実験を 1 本実行するメイン関数。
-
-    Args:
-        cfg: 実行設定 (YAMLロード済み)
-        argv: CLI引数 (cli.py から渡される)
-
-    Returns:
-        int: 終了コード (0: 成功, 1: 失敗)
+    Hydra対応版 run_experiment
     """
+    
+    # ------------------------------------------------------------------
+    # 1. パスとレイアウトの解決
+    # ------------------------------------------------------------------
+    # Hydraが既にディレクトリを作って移動してくれているので、
+    # ルートは「カレントディレクトリ (.)」とする。
+    
+    current_dir = Path.cwd()
+    print(f"[AL] Running in Hydra directory: {current_dir}")
 
-
-
-    # 0. 出力ディレクトリの構築と既存ディレクトリの扱い
-
-    # Config内の情報から、最終的な出力パスを決定
-    final_out_dir = ExperimentLayout.resolve_final_out_dir(cfg)
-
-    # Config の out_dir を強制的に上書き
+    # 既存の cfg["run"]["out_dir"] を上書き（layout.py がこれを参照するため）
+    # ※ cfg が DictConfig の場合もあるが、マッピングとして操作
     if "run" not in cfg:
         cfg["run"] = {}
-    cfg["run"]["out_dir"] = str(final_out_dir)
+    cfg["run"]["out_dir"] = str(current_dir)
 
-    # 既存ディレクトリがあった場合の扱いを設定から決定
-    run_cfg = cfg.get("run", {})
-    on_exist_raw = run_cfg.get("on_exist", "overwrite")
-    on_exist = str(on_exist_raw).lower()
-
-    print(f"[AL] Target Output Directory: {final_out_dir}")
-    print(f"[AL] on_exist policy: {on_exist}")
-
-    if final_out_dir.exists():
-        if on_exist in ("skip", "ignore"):
-            print(f"[AL] Existing run directory found. Skipping: {final_out_dir}")
-            # 2 = skipped
-            return 2
-
-        if on_exist in ("error", "fail"):
-            print(f"[AL] ERROR: Output directory already exists: {final_out_dir}")
-            return 1
-
-        # デフォルト: overwrite
-        if on_exist not in ("overwrite", "replace"):
-            print(
-                f"[AL] WARN: Unknown on_exist='{on_exist_raw}', "
-                "falling back to 'overwrite'."
-            )
-
-        print(f"[AL] Found existing run directory. Removing: {final_out_dir}")
-        try:
-            shutil.rmtree(final_out_dir)
-        except Exception as e:
-            print(f"[AL] Failed to remove directory: {e}")
-            sys.exit(1)
-
-    final_out_dir.mkdir(parents=True, exist_ok=True)
-
-
-    # 1) レイアウト構築 & ディレクトリ作成
-    layout = ExperimentLayout.from_cfg(cfg)
+    # レイアウト構築 
+    layout = ExperimentLayout.from_cfg(cfg) 
     layout.ensure_all_dirs()
 
-    # 2) ロガー準備（以降 tensaku.* のログは pipeline.log に集約される）
-    logger = _setup_logger(layout.path_log_pipeline())
+    # ------------------------------------------------------------------
+    # 2. ロガー準備 (Hydra対応)
+    # ------------------------------------------------------------------
+    # パス引数は渡さない
+    logger = _setup_logger(verbose=True)
 
-    # 3) 設定 & メタ情報のダンプ
+    # ------------------------------------------------------------------
+    # 3. 実験開始
+    # ------------------------------------------------------------------
     _dump_exp_config(layout, cfg)
     _dump_run_meta(layout, cfg, argv=argv)
 
@@ -417,6 +355,10 @@ def run_experiment(
                 for sid in selected_ids:
                     f.write(f"{sid}\n")
 
+        # (d) ラウンド終了後の遅延クリーンアップ
+        cleanup_round_delayed(cfg, layout, round_index=r)
+        
+
         # 次ラウンド用の状態更新
         state = new_state
         last_round_executed = r
@@ -437,7 +379,6 @@ def run_experiment(
         src_detail = layout.path_predictions_round_detail(last_round)
         src_assign = layout.path_predictions_round_gate_assign(last_round)
 
-
         # preds_detail.csv
         if src_detail.exists():
             dst_detail = layout.path_predictions_final_detail()
@@ -448,8 +389,17 @@ def run_experiment(
         # gate_assign.csv (もしあれば)
         if src_assign.exists():
             dst_assign = layout.path_predictions_final_gate_assign()
+            src_assign.parent.mkdir(parents=True, exist_ok=True) # 元ファイルがない場合はコピーできないが、念のため
+            dst_assign.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(src_assign, dst_assign)
             logger.info("Copied final gate assignments to %s", dst_assign)
+
+    
+    # 9) 実験終了後のクリーンアップ
+    if last_round_executed is not None:
+        cleanup_round_delayed(cfg, layout, round_index=last_round_executed + 1)
+        cleanup_post_experiment(cfg, layout)
+
 
     logger.info("AL pipeline finished successfully.")
     return 0

@@ -1,0 +1,46 @@
+# configs/config.yaml
+
+defaults:
+  - _self_
+  - al: base           # al/trust.yaml を使用
+  - model: bert         # model/bert.yaml を使用
+  - train: standard     # train/standard.yaml を使用
+  - infer: base         # infer/base.yaml を使用
+  - data: base          # data/base.yaml を使用
+  - split: standard     # split/standard.yaml を使用
+  - confidence: default # confidence/default.yaml を使用
+  - gate: default       # gate/default.yaml を使用
+  - run: base           # run/base.yaml を使用（中身はAL専用の共通設定）
+  - cleanup: base       # cleanup/base.yaml を使用
+  - task: sas           # task/sas.yaml を使用
+
+hydra:
+  # 単発実行時（--multirun じゃないとき）の作業ディレクトリ
+  run:
+    dir: outputs/${data.qid}/single_run/${now:%Y-%m-%d_%H-%M-%S}
+
+  # --multirun 時の設定
+  sweep:
+    # マルチラン全体のルート（必ず文字列にすること）
+    dir: .
+    # 1ジョブごとのサブディレクトリ
+    # 例: ./outputs/Y14_1-2_1_3/sampler=trust,budget=50/seed=1
+    subdir: outputs/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
+
+  # 各ジョブ配下に .hydra/config を置く場所
+  output_subdir: config
+
+  job:
+    chdir: true
+    config:
+      override_dirname:
+        # override_dirname から除外したいキー
+        # （パスの別レイヤーで管理するもの）
+        exclude_keys:
+          - run.seed
+          - data.qid
+          - run.on_exist
+          - run.out_dir
+          - run.data_dir
+          - al/sampler
+          - al.sampler.name

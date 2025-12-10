@@ -1,0 +1,4 @@
+name: "hybrid"
+k_cluster: 200
+sub_budget_ratio: 3.0
+uncertainty_strategy: "least_confidence"
