@@ -2,7 +2,7 @@ defaults:
   - sampler: random
   - _self_
 
-rounds: 1000
-budget: 50
+rounds: 3
+budget: 10
 stop_when_pool_empty: true
 seed: {run.seed}

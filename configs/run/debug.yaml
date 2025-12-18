@@ -1,10 +1,10 @@
 # configs/run/base.yaml
 seed: 42
-on_exist: skip   # ← 古い split を掴んで事故るのを避けるなら overwrite 推奨（運用で skip に戻すなら meta一致が前提）
+on_exist: overwrite   # ← 古い split を掴んで事故るのを避けるなら overwrite 推奨（運用で skip に戻すなら meta一致が前提）
 save_logits: true
 save_predictions: true
 
-outputs_root: "outputs"
+outputs_root: "outputs_debug"
 
 # ★ split artifacts の canonical location はここ
 data_dir: ${hydra:runtime.cwd}/${data.data_root}/q-${data.qid}/base_split

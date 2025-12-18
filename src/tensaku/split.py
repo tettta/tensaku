@@ -1,8 +1,17 @@
 # /home/esakit25/work/tensaku/src/tensaku/split.py
 # -*- coding: utf-8 -*-
-"""
-@module   : tensaku.split
-@role     : all.jsonl（マスタ）から単一 QID の {labeled, dev, test, pool} を生成する
+"""tensaku.split
+
+@role
+  - マスタデータ (all.jsonl) から {labeled, dev, test, pool} を生成する。
+
+@design (Strict)
+  - フォールバック/暗黙デフォルト禁止：必須キー欠落は即エラー。
+  - split は「データ分割」だけを知る。
+
+@io
+  - input : data.input_all (JSONL)
+  - output: run.data_dir/{labeled,dev,test,pool}.jsonl + meta.json
 """
 
 from __future__ import annotations
@@ -12,37 +21,72 @@ import json
 import logging
 import os
 import random
-import sys
 from collections import defaultdict
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 LOGGER = logging.getLogger(__name__)
 
 
-# ===================== 基本ユーティリティ =====================
-
-
 def _read_jsonl(path: str) -> List[dict]:
     rows: List[dict] = []
-    if not os.path.exists(path):
-        return rows
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
+            rows.append(json.loads(line))
     return rows
 
 
-def _write_jsonl(path: str, rows: Iterable[dict]) -> None:
+def _atomic_write_text(path: str, text: str) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        for r in rows:
-            f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _write_jsonl(path: str, rows: List[dict]) -> None:
+    text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+    _atomic_write_text(path, text)
+
+
+def _coerce_int_label_strict(v: Any, *, label_key: str, qid: str) -> int:
+    """Coerce label to int **without rounding**.
+
+    RIKEN SAS の総得点は整数である前提。
+    float/str でも整数表現 (e.g., 14.0, "7") は許容するが、
+    14.7 のような値は **データ不整合**として即エラーにする。
+    """
+    if v is None:
+        raise ValueError(f"[{qid}] label '{label_key}' is None")
+    # bool is subclass of int -> reject explicitly
+    if isinstance(v, bool):
+        raise ValueError(f"[{qid}] label '{label_key}' must be int, got bool")
+    if isinstance(v, int):
+        return int(v)
+    if isinstance(v, float):
+        if v.is_integer():
+            return int(v)
+        raise ValueError(
+            f"[{qid}] label '{label_key}' must be an integer-valued float, got {v}"
+        )
+    if isinstance(v, str):
+        s = v.strip()
+        if s == "":
+            raise ValueError(f"[{qid}] label '{label_key}' is empty string")
+        try:
+            fv = float(s)
+        except Exception as e:
+            raise ValueError(f"[{qid}] label '{label_key}' cannot parse '{v}'") from e
+        if fv.is_integer():
+            return int(fv)
+        raise ValueError(
+            f"[{qid}] label '{label_key}' must be integer-like, got '{v}'"
+        )
+    raise ValueError(f"[{qid}] label '{label_key}' has unsupported type: {type(v)}")
 
 
 def _ensure_id(rows: List[dict], prefix: str) -> None:
@@ -56,55 +100,48 @@ def _ensure_id(rows: List[dict], prefix: str) -> None:
         r["id"] = f"{prefix}{cnt:0{width}d}"
 
 
-def _infer_all_path(run_data_dir: str, data_cfg: Dict[str, Any]) -> str:
-    inp = data_cfg.get("input_all")
-    if not inp:
-        return os.path.join(run_data_dir, "all.jsonl")
-    inp = str(inp)
-    if os.path.isdir(inp):
-        return os.path.join(inp, "all.jsonl")
-    return inp
-
-
-# ===================== 分割ロジック =====================
-
-
-def _normalize_ratio(raw: Dict[str, float]) -> Dict[str, float]:
-    default_ratio = {"test": 0.2, "dev": 0.1, "labeled": 0.2, "pool": 0.5}
+def _validate_and_normalize_ratio(raw: Dict[str, Any]) -> Dict[str, float]:
+    """Strict: keys(test,dev,pool,labeled(or train)) 必須 & 正規化"""
     if not raw:
-        return default_ratio
+        raise ValueError("split.ratio is empty (Strict: defaults disabled)")
 
-    labeled_val = raw.get("labeled")
-    if labeled_val is None:
-        labeled_val = raw.get("train")
+    missing = []
+    for k in ("test", "dev", "pool"):
+        if k not in raw:
+            missing.append(k)
+    if ("labeled" not in raw) and ("train" not in raw):
+        missing.append("labeled")
+    if missing:
+        raise ValueError(f"split.ratio is missing required keys: {missing}. (Strict)")
 
-    r = {
-        "test": float(raw.get("test", default_ratio["test"])),
-        "dev": float(raw.get("dev", default_ratio["dev"])),
-        "labeled": float(labeled_val if labeled_val is not None else default_ratio["labeled"]),
-        "pool": float(raw.get("pool", default_ratio["pool"])),
+    labeled_val = raw.get("labeled", raw.get("train"))
+    ratio = {
+        "test": float(raw["test"]),
+        "dev": float(raw["dev"]),
+        "labeled": float(labeled_val),
+        "pool": float(raw["pool"]),
     }
-    s = sum(r.values())
-    if s <= 0:
-        return default_ratio
-    return {k: v / s for k, v in r.items()}
+    for k, v in ratio.items():
+        if v < 0:
+            raise ValueError(f"split.ratio.{k} must be >= 0, got {v}")
+
+    total = sum(ratio.values())
+    if total <= 0:
+        raise ValueError(f"Sum of split ratios must be positive: {ratio}")
+
+    return {k: (v / total) for k, v in ratio.items()}
 
 
 def _round_alloc(n_total: int, ratio: Dict[str, float]) -> Dict[str, int]:
     if n_total <= 0:
         return {k: 0 for k in ("test", "dev", "labeled", "pool")}
-
     keys = ["test", "dev", "labeled", "pool"]
-    r = {k: float(ratio.get(k, 0.0)) for k in keys}
-    s = sum(r.values()) or 1.0
-    desired = {k: n_total * r[k] / s for k in keys}
+    desired = {k: n_total * ratio[k] for k in keys}
     base = {k: int(desired[k]) for k in keys}
     used = sum(base.values())
     remain = max(0, n_total - used)
-
     frac = {k: desired[k] - base[k] for k in keys}
-    frac_sorted = sorted(keys, key=lambda k: frac[k], reverse=True)
-    for k in frac_sorted:
+    for k in sorted(keys, key=lambda k: frac[k], reverse=True):
         if remain <= 0:
             break
         base[k] += 1
@@ -112,18 +149,14 @@ def _round_alloc(n_total: int, ratio: Dict[str, float]) -> Dict[str, int]:
     return base
 
 
-def _split_indices_stratified(
-    labels: List[int],
-    ratio: Dict[str, float],
-    seed: int,
-) -> Dict[str, List[int]]:
+def _split_indices_stratified(labels: List[int], ratio: Dict[str, float], seed: int) -> Dict[str, List[int]]:
     rng = random.Random(seed)
     by_label: Dict[int, List[int]] = defaultdict(list)
     for idx, y in enumerate(labels):
         by_label[int(y)].append(idx)
 
     splits = {"test": [], "dev": [], "labeled": [], "pool": []}
-    for lab, idxs in by_label.items():
+    for _, idxs in by_label.items():
         if not idxs:
             continue
         rng.shuffle(idxs)
@@ -131,24 +164,17 @@ def _split_indices_stratified(
         i = 0
         for split_name in ("test", "dev", "labeled", "pool"):
             k = alloc[split_name]
-            if k <= 0:
-                continue
             splits[split_name].extend(idxs[i : i + k])
             i += k
     return splits
 
 
-def _split_indices_simple(
-    n_total: int,
-    ratio: Dict[str, float],
-    seed: int,
-) -> Dict[str, List[int]]:
+def _split_indices_simple(n_total: int, ratio: Dict[str, float], seed: int) -> Dict[str, List[int]]:
     rng = random.Random(seed)
     idxs = list(range(n_total))
     rng.shuffle(idxs)
     alloc = _round_alloc(n_total, ratio)
-
-    splits = {}
+    splits: Dict[str, List[int]] = {}
     cur = 0
     for split_name in ("test", "dev", "labeled", "pool"):
         k = alloc[split_name]
@@ -157,207 +183,143 @@ def _split_indices_simple(
     return splits
 
 
-# ===================== エントリポイント =====================
-
-
 def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--dry-run", action="store_true", default=False)
-    ns, _rest = parser.parse_known_args(argv or [])
+    ns, _ = parser.parse_known_args(argv or [])
 
-    run_cfg = cfg.get("run") or {}
-    data_cfg = cfg.get("data") or {}
-    split_cfg = cfg.get("split") or {}
+    if "run" not in cfg or "data" not in cfg or "split" not in cfg:
+        raise ValueError("cfg must contain 'run', 'data', 'split' sections (Strict)")
 
-    data_dir = run_cfg.get("data_dir") or data_cfg.get("data_dir")
-    if not data_dir:
-        LOGGER.error("run.data_dir or data.data_dir must be set.")
-        return 2
-    data_dir = str(data_dir)
+    run_cfg = cfg["run"]
+    data_cfg = cfg["data"]
+    split_cfg = cfg["split"]
+
+    data_dir = str(run_cfg["data_dir"])
+    qid = str(data_cfg["qid"])
+    label_key = str(data_cfg["label_key"])
+    all_path = str(data_cfg["input_all"])
+
+    seed = int(split_cfg["seed"])
+    stratify = bool(split_cfg["stratify"])
+
     os.makedirs(data_dir, exist_ok=True)
-
-    qid = data_cfg.get("qid") or run_cfg.get("qid")
-    if not qid:
-        LOGGER.error("data.qid or run.qid must be set.")
-        return 2
-    qid = str(qid)
-
-    label_key = data_cfg.get("label_key") or "score"
-    seed = int(split_cfg.get("seed") or 42)
-    stratify_cfg = split_cfg.get("stratify")
-    stratify = True if stratify_cfg is None else bool(stratify_cfg)
-
-    all_path = _infer_all_path(data_dir, data_cfg)
     if not os.path.exists(all_path):
-        LOGGER.error(f"all.jsonl not found: {all_path}")
+        LOGGER.error("all.jsonl not found: %s", all_path)
         return 2
 
-    ratio_raw = split_cfg.get("ratio") or {}
-    ratio = _normalize_ratio(ratio_raw)
-
+    ratio_raw = split_cfg.get("ratio")
     n_train_cfg = split_cfg.get("n_train")
-    n_train: Optional[int] = None
-    if n_train_cfg is not None:
-        try:
-            n_train = int(n_train_cfg)
-        except Exception:
-            LOGGER.warning(f"invalid split.n_train={n_train_cfg!r} (ignored)")
-            n_train = None
+    if (not ratio_raw) and (n_train_cfg is None):
+        raise ValueError("Either split.ratio or split.n_train must be set. (Strict)")
 
     all_rows = _read_jsonl(all_path)
     rows = [r for r in all_rows if str(r.get("qid")) == qid]
     if not rows:
-        LOGGER.error(f"no rows found for qid={qid!r} in {all_path}")
+        LOGGER.error("no rows found for qid=%r in %s", qid, all_path)
         return 2
 
     _ensure_id(rows, prefix=f"{qid}_")
 
     labels: List[int] = []
-    label_values: List[float] = []
-    all_int_like = True
-
     for r in rows:
-        raw = r.get(label_key, 0)
-        try:
-            v = float(raw)
-        except Exception:
-            v = 0.0
-        label_values.append(v)
+        if label_key not in r:
+            raise KeyError(f"label_key '{label_key}' is missing in a record (qid={qid})")
+        labels.append(_coerce_int_label_strict(r[label_key], label_key=label_key, qid=qid))
 
-        iv = int(round(v))
-        if abs(v - iv) > 1e-9:
-            all_int_like = False
-        labels.append(iv)
-
-    if label_values:
-        label_min = min(label_values)
-        label_max = max(label_values)
-    else:
-        label_min = None
-        label_max = None
-    label_type = "int" if all_int_like else "float"
-
-    num_labels: Optional[int] = None
-    is_classification = False
-    if (
-        label_min is not None
-        and label_max is not None
-        and all_int_like
-        and label_min >= 0
-    ):
-        try:
-            max_int = int(round(label_max))
-        except Exception:
-            max_int = None
-        else:
-            if max_int >= 0:
-                is_classification = True
-                num_labels = max_int + 1
+    # label stats (Strict): classification labels must be contiguous.
+    label_min = min(labels)
+    label_max = max(labels)
+    unique_labels = sorted(set(labels))
+    expected = list(range(label_min, label_max + 1))
+    if unique_labels != expected:
+        raise ValueError(
+            f"[{qid}] labels must be contiguous ints. "
+            f"got unique_labels={unique_labels} (min={label_min}, max={label_max})"
+        )
+    if label_min != 0:
+        raise ValueError(
+            f"[{qid}] labels must start at 0 (Strict). got min={label_min}, max={label_max}"
+        )
+    num_labels = label_max + 1
 
     n_total = len(rows)
+
     mode = "ratio"
-    if n_train is not None and n_total > 0:
-        base_test = float(ratio.get("test", 0.0))
-        base_dev = float(ratio.get("dev", 0.0))
-        sum_td = base_test + base_dev
+    ratio: Dict[str, float]
+    ratio_sig: Dict[str, float]
+    n_train_sig: Optional[int] = None
 
-        if sum_td >= 1.0:
-            LOGGER.error(
-                f"split.ratio.test + dev = {sum_td:.3f} >= 1.0; no room for n_train."
-            )
-            return 2
-
-        approx_n_test = int(round(n_total * base_test))
-        approx_n_dev = int(round(n_total * base_dev))
-        max_n_train = max(0, n_total - approx_n_test - approx_n_dev)
-
-        if n_train < 0:
-            LOGGER.warning(f"split.n_train={n_train} < 0; clipped to 0.")
-            n_train = 0
-        if n_train > max_n_train:
-            LOGGER.warning(
-                f"split.n_train={n_train} > max_available={max_n_train}; clipped."
-            )
-            n_train = max_n_train
-
-        labeled_ratio = float(n_train) / float(n_total) if n_total > 0 else 0.0
-        pool_ratio = max(0.0, 1.0 - base_test - base_dev - labeled_ratio)
-
-        ratio = {
-            "labeled": labeled_ratio,
-            "test": base_test,
-            "dev": base_dev,
-            "pool": pool_ratio,
-        }
+    if n_train_cfg is not None:
         mode = "n_train"
+        n_train = int(n_train_cfg)
+        if not ratio_raw or ("test" not in ratio_raw) or ("dev" not in ratio_raw):
+            raise ValueError("split.n_train requires split.ratio.test and split.ratio.dev. (Strict)")
 
-    ratio_log = {k: round(float(v), 3) for k, v in ratio.items()}
+        base_test = float(ratio_raw["test"])
+        base_dev = float(ratio_raw["dev"])
 
-    LOGGER.info(f"qid={qid} total={n_total} all_path={all_path}")
-    LOGGER.info(f"mode={mode} n_train={n_train}")
-    LOGGER.info(f"ratio={ratio_log} seed={seed} stratify={stratify}")
+        approx_test = int(round(n_total * base_test))
+        approx_dev = int(round(n_total * base_dev))
+        if n_train + approx_test + approx_dev > n_total:
+            raise ValueError(
+                f"Impossible split: n_train={n_train} + approx(test/dev)={approx_test}/{approx_dev} > total={n_total}"
+            )
+
+        l_ratio = n_train / n_total if n_total else 0.0
+        p_ratio = max(0.0, 1.0 - base_test - base_dev - l_ratio)
+        ratio = {"labeled": l_ratio, "pool": p_ratio, "test": base_test, "dev": base_dev}
+
+        ratio_sig = {"test": base_test, "dev": base_dev}
+        n_train_sig = n_train
+    else:
+        ratio = _validate_and_normalize_ratio(ratio_raw)
+        ratio_sig = dict(ratio)
 
     if stratify:
-        idx_splits = _split_indices_stratified(labels, ratio, seed=seed)
+        idx_splits = _split_indices_stratified(labels, ratio, seed)
     else:
-        idx_splits = _split_indices_simple(n_total, ratio, seed=seed)
+        idx_splits = _split_indices_simple(n_total, ratio, seed)
 
-    labeled_rows = [rows[i] for i in idx_splits["labeled"]]
-    dev_rows = [rows[i] for i in idx_splits["dev"]]
-    test_rows = [rows[i] for i in idx_splits["test"]]
+    labeled = [rows[i] for i in idx_splits["labeled"]]
+    dev = [rows[i] for i in idx_splits["dev"]]
+    test = [rows[i] for i in idx_splits["test"]]
     pool_rows = [rows[i] for i in idx_splits["pool"]]
 
-    counts = {
-        "labeled": len(labeled_rows),
-        "dev": len(dev_rows),
-        "test": len(test_rows),
-        "pool": len(pool_rows),
-    }
-    LOGGER.info(f"counts: {counts}")
+    pool: List[dict] = []
+    for r in pool_rows:
+        rr = dict(r)
+        rr.pop(label_key, None)
+        pool.append(rr)
 
     if ns.dry_run:
-        LOGGER.info("dry-run: no files written.")
         return 0
 
-    path_labeled = os.path.join(data_dir, "labeled.jsonl")
-    path_dev = os.path.join(data_dir, "dev.jsonl")
-    path_test = os.path.join(data_dir, "test.jsonl")
-    path_pool = os.path.join(data_dir, "pool.jsonl")
-
-    _write_jsonl(path_labeled, labeled_rows)
-    _write_jsonl(path_dev, dev_rows)
-    _write_jsonl(path_test, test_rows)
-    _write_jsonl(path_pool, pool_rows)
+    _write_jsonl(os.path.join(data_dir, "labeled.jsonl"), labeled)
+    _write_jsonl(os.path.join(data_dir, "dev.jsonl"), dev)
+    _write_jsonl(os.path.join(data_dir, "test.jsonl"), test)
+    _write_jsonl(os.path.join(data_dir, "pool.jsonl"), pool)
 
     meta = {
         "qid": qid,
-        "data_dir": data_dir,
-        "all_path": all_path,
+        "data_dir": os.path.abspath(data_dir),
+        "input_all": os.path.abspath(all_path),
         "label_key": label_key,
-        "seed": seed,
-        "mode": mode,
-        "n_train": n_train,
-        "ratio": ratio,
-        "stratify": stratify,
-        "counts": counts,
-        "label_min": label_min,
-        "label_max": label_max,
-        "label_type": label_type,
-        "is_classification": is_classification,
-        "num_labels": num_labels,
+        "label_stats": {
+            "label_min": label_min,
+            "label_max": label_max,
+            "num_labels": num_labels,
+            "unique_count": len(unique_labels),
+            "unique_labels": unique_labels,
+        },
+        "split": {
+            "seed": seed,
+            "stratify": stratify,
+            "mode": mode,
+            "n_train": n_train_sig,
+            "ratio": ratio_sig,  # n_train modeでは test/dev のみ
+        },
+        "counts": {"labeled": len(labeled), "dev": len(dev), "test": len(test), "pool": len(pool)},
     }
-
-    meta_path = os.path.join(data_dir, "meta.json")
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    LOGGER.info(f"Wrote split files and meta.json to {data_dir}")
-
+    _atomic_write_text(os.path.join(data_dir, "meta.json"), json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
     return 0
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    LOGGER.info("Run via CLI: tensaku split -c <CFG.yaml>")

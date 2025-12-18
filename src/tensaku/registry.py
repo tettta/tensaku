@@ -12,7 +12,7 @@
 @api
   - from tensaku.registry import register, get, create, list_names
   - lazy bootstrap: 未登録 name 要求時に tensaku.confidence / tensaku.trustscore を import
-  - active bootstrap: confidence.create_estimator / trustscore.TrustScorer を用い能動的に register
+  - bootstrap: import modules for side-effect registrations
 @contracts
   - register(name) は同名がある場合は KeyError（override=True で上書き許可）
   - lazy/active bootstrap は import 失敗時も安全に無視（get は最終的に未登録なら KeyError）
@@ -41,10 +41,7 @@ def register(name: str, *, override: bool = False):
 def list_names() -> List[str]:
     return sorted(_REGISTRY.keys())
 
-# ===== Lazy bootstrap (強化版) ========================================================
-
-# 信頼度の既定セット（confidence 側のファクトリ名）
-_DEFAULT_CONF_NAMES = ("msp", "entropy", "energy", "margin", "mc_dropout")
+# ===== Lazy bootstrap ================================================================
 
 def _try_import(module: str) -> Optional[Any]:
     try:
@@ -53,54 +50,20 @@ def _try_import(module: str) -> Optional[Any]:
     except Exception:
         return None
 
-def _active_register_confidence(conf_mod: Any) -> None:
-    """
-    confidence モジュールの create_estimator を用いて、未登録分をレジストリに能動登録する。
-    """
-    create_estimator = getattr(conf_mod, "create_estimator", None)
-    if create_estimator is None:
-        return
-    for name in _DEFAULT_CONF_NAMES:
-        if name in _REGISTRY:
-            continue
-        def _factory(_name=name, _ce=create_estimator, **kw):
-            return _ce(_name, **kw)
-        register(name)(_factory)
-
-def _active_register_trustscore(ts_mod: Any) -> None:
-    """
-    trustscore モジュールの TrustScorer を 'trust' として登録（未登録時のみ）。
-    （trustscore.py 側で @register('trust') 済みでも、未登録ならバックアップとして登録する）
-    """
-    if "trust" in _REGISTRY:
-        return
-    Scorer = getattr(ts_mod, "TrustScorer", None)
-    if Scorer is None:
-        return
-    register("trust")(Scorer)
-
 def _lazy_bootstrap_for(name: Optional[str] = None) -> None:
+    """Import modules that register estimators via decorators (best-effort).
+
+    - This keeps registry as a simple name→object map.
+    - confidence/trustscore are responsible for calling @register(...) at import time.
     """
-    未登録 name が要求されたときに呼ばれる遅延ブート。
-    1) tensaku.confidence を import（副作用登録を期待）
-    2) 未登録が残っていれば、こちらで create_estimator を使って能動登録
-    3) name が 'trust' 系なら tensaku.trustscore も同様に処理
-    """
-    # 何か既に登録があればスキップ（高速化）
-    if _REGISTRY and (name in _REGISTRY if name else True):
-        return
+    # Import confidence estimators (msp/entropy/margin/energy/trust, etc.)
+    _try_import("tensaku.confidence")
 
-    conf_mod = _try_import("tensaku.confidence")
-    if conf_mod is not None:
-        _active_register_confidence(conf_mod)
+    # Import trustscore implementation if requested (or if 'trust' is missing)
+    if name == "trust" or name is None:
+        _try_import("tensaku.trustscore")
 
-    # trust 系も取りこぼし防止
-    if (name == "trust") or (name not in _REGISTRY):
-        ts_mod = _try_import("tensaku.trustscore")
-        if ts_mod is not None:
-            _active_register_trustscore(ts_mod)
-
-# ===== Public getters =================================================================
+# ===== Public getters ================================================================= =================================================================
 
 def get(name: str) -> Any:
     """登録オブジェクトを取得。無ければ lazy import/登録を行い、見つからなければ KeyError。"""

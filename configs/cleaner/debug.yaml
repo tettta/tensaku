@@ -1,0 +1,9 @@
+# configs/cleaner/debug.yaml
+# Debug: do not delete anything (keep artifacts for inspection)
+round_end:
+  enabled: false
+  kinds: []
+
+experiment_end:
+  enabled: false
+  kinds: []

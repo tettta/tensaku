@@ -1,146 +1,212 @@
+# /home/esakit25/work/tensaku/src/tensaku/utils/cleaner.py
 # -*- coding: utf-8 -*-
-"""
-@module: tensaku.utils.cleaner
-@role  : 実験中の中間ファイル（チェックポイント、推論結果など）を削除し、ディスク容量を管理する。
-@note  : 削除タイミングには「即時 (Immediate)」と「遅延 (Delayed)」の2種類がある。
-         - Immediate: タスク終了直後。サンプラーが使用しない巨大ファイル（ckpt等）を即消す。
-         - Delayed  : サンプリング終了後。サンプラーが参照し終えた「前ラウンド」のファイルを消す。
+"""tensaku.utils.cleaner
+
+@role:
+  - Round-end / experiment-end file cleanup driven by:
+      (1) Layout ledger (what artifacts were produced)
+      (2) Config (which artifact kinds to delete)
+
+@design:
+  - No silent fallback for config keys: missing cleaner config is an error.
+  - Layout must expose a readable ledger interface; otherwise error with actionable message.
+  - Deleting a file that is already missing is NOT an error (missing_ok) because
+    external processes or previous cleanups may have removed it.
 """
 
-import shutil
-import logging
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple, Union
+import logging
+import shutil
 
-LOGGER = logging.getLogger(__name__)
+from tensaku.utils.strict_cfg import ConfigError, require_mapping, require_list, require_bool, require_str
+
+logger = logging.getLogger(__name__)
 
 
-def cleanup_round_immediate(cfg: Mapping[str, Any], layout: Any, round_index: int) -> None:
+def clean_round_end(*, layout: Any, cfg: Mapping[str, Any], round_index: int) -> Dict[str, Any]:
+    """Delete artifacts at round end.
+
+    Required config:
+      cleaner.round_end.enabled: bool
+      cleaner.round_end.kinds: list[str]
     """
-    【即時削除 (Immediate Cleanup)】
-    設定キー: run.cleanup.immediate
+    cleaner_cfg = require_mapping(cfg, "cleaner")
+    round_cfg = require_mapping(cleaner_cfg, "round_end")
+    enabled = require_bool(round_cfg, "enabled")
+    kinds = require_list(round_cfg, "kinds")
+    kinds = [str(k) for k in kinds]
+
+    if not enabled or not kinds:
+        return {"enabled": enabled, "deleted": 0, "kinds": kinds}
+
+    entries = list(_iter_round_entries(layout=layout, round_index=round_index))
+    deleted = 0
+    for e in entries:
+        kind = _get_kind(e)
+        if kind not in kinds:
+            continue
+        p = _get_path(e)
+        if p is None:
+            continue
+        deleted += _delete_path(p)
+
+    logger.info("[cleaner] round_end: round=%d kinds=%s deleted=%d", round_index, kinds, deleted)
+    return {"enabled": enabled, "deleted": deleted, "kinds": kinds, "round": int(round_index)}
+
+
+def clean_experiment_end(*, layout: Any, cfg: Mapping[str, Any]) -> Dict[str, Any]:
+    """Optional experiment-end cleanup.
+
+    Required config:
+      cleaner.experiment_end.enabled: bool
+      cleaner.experiment_end.kinds: list[str]
     """
-    run_cfg = cfg.get("run", {})
-    # ★変更: per_round ではなく immediate を読む
-    cleanup_cfg = run_cfg.get("cleanup", {}).get("immediate", {})
+    cleaner_cfg = require_mapping(cfg, "cleaner")
+    exp_cfg = require_mapping(cleaner_cfg, "experiment_end")
+    enabled = require_bool(exp_cfg, "enabled")
+    kinds = require_list(exp_cfg, "kinds")
+    kinds = [str(k) for k in kinds]
 
-    if not cleanup_cfg:
-        return
+    if not enabled or not kinds:
+        return {"enabled": enabled, "deleted": 0, "kinds": kinds}
 
-    # 1. Checkpoints
-    if cleanup_cfg.get("checkpoints", False):
-        ckpt_dir = layout.path_models_round_dir(round_index) / "checkpoints_min"
-        if ckpt_dir.exists():
+    entries = list(_iter_all_entries(layout=layout))
+    deleted = 0
+    for e in entries:
+        kind = _get_kind(e)
+        if kind not in kinds:
+            continue
+        p = _get_path(e)
+        if p is None:
+            continue
+        deleted += _delete_path(p)
+
+    logger.info("[cleaner] experiment_end: kinds=%s deleted=%d", kinds, deleted)
+    return {"enabled": enabled, "deleted": deleted, "kinds": kinds}
+
+
+# --------------------------------------------------------------------
+# Ledger access (Layout-dependent)
+# --------------------------------------------------------------------
+
+def _iter_round_entries(*, layout: Any, round_index: int) -> Iterator[Any]:
+    """Read ledger entries for a given round.
+
+    We support several common Layout APIs. If none are found, raise ConfigError.
+    """
+    # Preferred: list_artifacts(round_index=...)
+    if hasattr(layout, "list_artifacts") and callable(getattr(layout, "list_artifacts")):
+        return iter(layout.list_artifacts(round_index=round_index))  # type: ignore
+
+    # Alternative: iter_artifacts(round_index=...)
+    if hasattr(layout, "iter_artifacts") and callable(getattr(layout, "iter_artifacts")):
+        return iter(layout.iter_artifacts(round_index=round_index))  # type: ignore
+
+    # Alternative: ledger_round(round_index)
+    if hasattr(layout, "ledger_round") and callable(getattr(layout, "ledger_round")):
+        return iter(layout.ledger_round(round_index))  # type: ignore
+
+    # Alternative: ledger attribute that is list/dict with per-round mapping
+    if hasattr(layout, "ledger"):
+        led = getattr(layout, "ledger")
+        if callable(led):
+            # ledger(round_index=...)
             try:
-                shutil.rmtree(ckpt_dir, ignore_errors=True)
-                LOGGER.debug(f"[Cleanup-Immediate] Removed checkpoints: {ckpt_dir}")
-            except OSError as e:
-                LOGGER.warning(f"[Cleanup-Immediate] Failed to remove {ckpt_dir}: {e}")
+                return iter(led(round_index=round_index))
+            except TypeError:
+                pass
+        # dict-like: ledger[round_index]
+        try:
+            if isinstance(led, dict) and round_index in led:
+                return iter(led[round_index])
+        except Exception:
+            pass
 
-    # 2. Temp Data
-    if cleanup_cfg.get("temp_data", False):
-        temp_dir = layout.path_temp_round_dir(round_index)
-        if temp_dir.exists():
+    raise ConfigError(
+        "Layout does not expose a readable ledger interface required by cleaner. "
+        "Expected one of: layout.list_artifacts(round_index=...), layout.iter_artifacts(round_index=...), "
+        "layout.ledger_round(round_index), or layout.ledger. "
+        "Please implement one of these in layout so cleaner can delete artifacts by kind."
+    )
+
+
+def _iter_all_entries(*, layout: Any) -> Iterator[Any]:
+    """Read all ledger entries (best effort, but API must exist)."""
+    if hasattr(layout, "list_artifacts") and callable(getattr(layout, "list_artifacts")):
+        return iter(layout.list_artifacts())  # type: ignore
+    if hasattr(layout, "iter_artifacts") and callable(getattr(layout, "iter_artifacts")):
+        return iter(layout.iter_artifacts())  # type: ignore
+    if hasattr(layout, "ledger"):
+        led = getattr(layout, "ledger")
+        if callable(led):
             try:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                LOGGER.debug(f"[Cleanup-Immediate] Removed temp dir: {temp_dir}")
-            except OSError as e:
-                LOGGER.warning(f"[Cleanup-Immediate] Failed to remove {temp_dir}: {e}")
+                return iter(led())
+            except TypeError:
+                pass
+        if isinstance(led, list):
+            return iter(led)
+        if isinstance(led, dict):
+            # flatten
+            def _flat():
+                for v in led.values():
+                    if isinstance(v, list):
+                        for e in v:
+                            yield e
+            return iter(list(_flat()))
+    raise ConfigError(
+        "Layout does not expose a readable ledger interface required by cleaner (all entries). "
+        "Implement list_artifacts()/iter_artifacts()/ledger in layout."
+    )
 
 
-def cleanup_round_delayed(cfg: Mapping[str, Any], layout: Any, round_index: int) -> None:
-    """
-    【遅延削除 (Delayed Cleanup)】
-    設定キー: run.cleanup.delayed
-    """
-    target_round_index = round_index - 1
-    if target_round_index < 0:
-        return
-
-    run_cfg = cfg.get("run", {})
-    cleanup_cfg = run_cfg.get("cleanup", {}).get("delayed", {})
-
-    if not cleanup_cfg:
-        return
-
-    LOGGER.info(f"[Cleanup-Delayed] Processing artifacts for previous round {target_round_index}...")
-
-    # 3. Infer Arrays
-    if cleanup_cfg.get("infer_arrays", False):
-        infer_dir = layout.path_rounds_infer_dir(target_round_index)
-        if infer_dir.exists():
-            try:
-                shutil.rmtree(infer_dir, ignore_errors=True)
-                LOGGER.debug(f"  Removed infer arrays: {infer_dir}")
-            except OSError as e:
-                LOGGER.warning(f"  Failed to remove {infer_dir}: {e}")
-
-    # 4. Global Arrays
-    if cleanup_cfg.get("arrays", False):
-        arrays_dir = getattr(layout, "arrays_rounds_dir", None)
-        if arrays_dir and arrays_dir.exists():
-            round_name = layout.round_name(target_round_index)
-            prefix = f"{round_name}_"
-            count = 0
-            for p in arrays_dir.glob(f"{prefix}*.npy"):
-                try:
-                    p.unlink()
-                    count += 1
-                except OSError:
-                    pass
-            if count > 0:
-                LOGGER.debug(f"  Removed {count} array files for {round_name}")
+def _get_kind(entry: Any) -> str:
+    if isinstance(entry, dict):
+        k = entry.get("kind")
+        return str(k) if k is not None else ""
+    # object with attribute
+    return str(getattr(entry, "kind", "") or "")
 
 
-def cleanup_post_experiment(cfg: Mapping[str, Any], layout: Any) -> None:
-    """
-    【実験終了後削除 (Post-Experiment Cleanup)】
-    
-    実行タイミング:
-        al.py のループ脱出後、終了処理の直前。
-        
-    目的:
-        実験中に保持していたが、分析が終われば不要になる全ファイルを一括削除する。
-        
-    対象 (run.cleanup.post_experiment):
-        - all_checkpoints: 全ラウンドの checkpoints
-        - infer_arrays   : 全ラウンドの infer ディレクトリ
-        - temp_dirs      : temp_data ディレクトリ全体
-    """
-    run_cfg = cfg.get("run", {})
-    cleanup_cfg = run_cfg.get("cleanup", {}).get("post_experiment", {})
+def _get_path(entry: Any) -> Optional[Path]:
+    raw = None
+    if isinstance(entry, dict):
+        raw = entry.get("path") or entry.get("p") or entry.get("file")
+    else:
+        raw = getattr(entry, "path", None) or getattr(entry, "p", None) or getattr(entry, "file", None)
 
-    if not cleanup_cfg:
-        return
+    if raw is None:
+        return None
 
-    LOGGER.info("[Cleanup-Post] Starting post-experiment cleanup...")
-    out_dir = layout.root
+    # layout may store wrapper objects with `.path` attribute
+    if hasattr(raw, "path"):
+        try:
+            raw2 = getattr(raw, "path")
+            if isinstance(raw2, (str, Path)):
+                return Path(raw2)
+        except Exception:
+            pass
 
-    # 1. 全Checkpoints削除 (models/*/checkpoints_min)
-    if cleanup_cfg.get("all_checkpoints", False):
-        # models/round_*/checkpoints_min を探索
-        count = 0
-        for p in out_dir.glob("models/*/checkpoints_min"):
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-                count += 1
-        if count > 0:
-            LOGGER.info(f"  Removed checkpoints in {count} directories.")
+    if isinstance(raw, Path):
+        return raw
+    return Path(str(raw))
 
-    # 2. 全Infer Arrays削除 (rounds/*/infer)
-    if cleanup_cfg.get("infer_arrays", False):
-        count = 0
-        for p in out_dir.glob("rounds/*/infer"):
-            if p.is_dir():
-                shutil.rmtree(p, ignore_errors=True)
-                count += 1
-        if count > 0:
-            LOGGER.info(f"  Removed infer arrays in {count} directories.")
 
-    # 3. Tempディレクトリ自体の削除
-    if cleanup_cfg.get("temp_dirs", False):
-        # temp_data は通常 out_dir 直下にあると想定
-        temp_root = out_dir / "temp_data"
-        if temp_root.exists():
-            shutil.rmtree(temp_root, ignore_errors=True)
-            LOGGER.info(f"  Removed temp root dir: {temp_root}")
+def _delete_path(p: Path) -> int:
+    """Delete file or directory. Return 1 if something was deleted, else 0."""
+    try:
+        if p.is_dir():
+            shutil.rmtree(p, ignore_errors=True)
+            return 1
+        # file
+        p.unlink(missing_ok=True)
+        return 1 if not p.exists() else 0
+    except Exception as e:
+        raise RuntimeError(f"Failed to delete artifact path: {p} ({e})") from e
+
+
+# Backward compatibility alias (old name)
+def cleanup_after_round(*, layout: Any, cfg: Mapping[str, Any], round_index: int) -> Dict[str, Any]:
+    return clean_round_end(layout=layout, cfg=cfg, round_index=round_index)

@@ -2,13 +2,13 @@
 qid: ${qid.value}
 
 data_root: data_sas
-split_dir: splits
+splits_dir: splits_debug
 
 # base split（不変・qid固定）
-base_dir: ${run.data_dir}
+base_dir: ${hydra:runtime.cwd}/${data_root}/${splits_dir}/${data.qid}
 
 # マスタデータ
-input_all: /home/esakit25/work/tensaku/data_sas/all.jsonl
+input_all: ${hydra:runtime.cwd}/${data_root}/all.jsonl
 
 files:
   labeled: labeled.jsonl

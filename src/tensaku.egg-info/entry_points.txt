@@ -1,2 +1,0 @@
-[console_scripts]
-tensaku = tensaku.cli:main

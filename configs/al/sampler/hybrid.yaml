@@ -1,4 +1,8 @@
-name: "hybrid"
+name: hybrid
 k_cluster: 200
+k: 200
 sub_budget_ratio: 3.0
-uncertainty_strategy: "least_confidence"
+# 不確実性側で使うスコア（msp or trust）
+conf_key: trust
+# round0 のみ切替可能
+round0: trust

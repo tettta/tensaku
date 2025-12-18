@@ -1,0 +1,10 @@
+# configs/cleaner/base.yaml
+# Round-end cleanup based on layout ledger + kinds.
+round_end:
+  enabled: true
+  # Delete heavy artifacts by default (keep preds/meta)
+  kinds: [array, logit, emb, prob, ckpt]
+
+experiment_end:
+  enabled: false
+  kinds: []

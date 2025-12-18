@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """
 @module     : tensaku.train
-@role       : 分類モデルの学習実行（I/O 分離・統合版）
+@role       : 分類モデルの学習実行（Strict Mode）
 @overview   :
-    - train_core: DatasetSplit (メモリ上データ) を受け取り、学習を実行するコアロジック。
-                  学習済みモデルを返すオプションあり。
-    - run       : CLI 用ラッパー。
+    - train_core: メモリ上の DatasetSplit を受け取り学習を実行。
+                  Config不備は即座にエラーとする（サイレントなフォールバック禁止）。
+    - 安定化: AdamW(weight_decay), warmup, grad clipping, bf16時はGradScaler無効化。
 """
 
 from __future__ import annotations
@@ -16,35 +16,33 @@ import math
 import os
 import json
 import random
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Mapping
 
 import numpy as np
 import torch
 from torch.amp import GradScaler, autocast
+from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import AdamW
 from transformers import get_linear_schedule_with_warmup
 from sklearn.metrics import cohen_kappa_score
 
-# Phase2 連携用
+from tensaku.fs_core import ArtifactDir
 from tensaku.data.base import DatasetSplit
-# モデル定義 (Phase2)
 from tensaku.models import create_model, create_tokenizer
 
 LOGGER = logging.getLogger(__name__)
 
 
 # =============================================================================
-# ユーティリティ
+# Utilities
 # =============================================================================
-
 
 def _read_jsonl(path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     if not os.path.exists(path):
-        LOGGER.error(f"File not found: {path}")
+        LOGGER.error("File not found: %s", path)
         return rows
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -56,22 +54,6 @@ def _read_jsonl(path: str) -> List[Dict[str, Any]]:
             except Exception:
                 continue
     return rows
-
-
-def _load_meta_if_exists(data_dir: str) -> Dict[str, Any]:
-    path = os.path.join(data_dir, "meta.json")
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-    except Exception as e:
-        LOGGER.warning(f"Failed to read meta.json: {path} ({e})")
-        return {}
-    if not isinstance(meta, dict):
-        LOGGER.warning(f"meta.json is not a JSON object: {path}")
-        return {}
-    return meta
 
 
 def _normalize_labels(
@@ -101,31 +83,31 @@ def _normalize_labels(
             max_y = y
 
     if bad > 0:
-        LOGGER.warning(f"Skipped {bad} rows in {split_name} due to invalid '{label_key}'")
+        LOGGER.warning("Skipped %d rows in %s due to invalid '%s'", bad, split_name, label_key)
 
     return clean, min_y, max_y
 
 
-def _analyze_token_lengths(rows: List[Dict[str, Any]], tok, text_key: str, split_name: str):
-    """データセットのトークン長統計を表示する"""
-    lengths = []
+def _analyze_token_lengths(rows: List[Dict[str, Any]], tok, text_key: str, split_name: str) -> None:
+    lengths: List[int] = []
     for r in rows:
         text = r.get(text_key, "")
         if isinstance(text, list):
             text = " ".join(map(str, text))
         ids = tok.encode(str(text), add_special_tokens=True)
         lengths.append(len(ids))
-    
+
     if not lengths:
         return
-    
-    lengths = np.array(lengths)
+
+    arr = np.array(lengths)
     LOGGER.info(
-        f"Token Stats ({split_name}): "
-        f"Mean={lengths.mean():.1f}, "
-        f"Median={np.median(lengths):.1f}, "
-        f"Max={lengths.max()}, "
-        f"95%tile={np.percentile(lengths, 95):.1f}"
+        "Token Stats (%s): Mean=%.1f, Median=%.1f, Max=%d, 95%%tile=%.1f",
+        split_name,
+        float(arr.mean()),
+        float(np.median(arr)),
+        int(arr.max()),
+        float(np.percentile(arr, 95)),
     )
 
 
@@ -134,17 +116,17 @@ class EssayDS(Dataset):
         self,
         rows: List[Dict[str, Any]],
         tok,
-        text_key: str = "mecab",
-        label_key: str = "score",
-        max_len: int = 128,
+        text_key: str,
+        label_key: str,
+        max_len: int,
         with_label: bool = True,
     ) -> None:
         self.rows = rows
         self.tok = tok
         self.text_key = text_key
         self.label_key = label_key
-        self.max_len = max_len
-        self.with_label = with_label
+        self.max_len = int(max_len)
+        self.with_label = bool(with_label)
 
     def __len__(self) -> int:
         return len(self.rows)
@@ -155,7 +137,7 @@ class EssayDS(Dataset):
         if isinstance(text, list):
             text = " ".join(map(str, text))
         enc = self.tok(
-            text,
+            str(text),
             truncation=True,
             padding="max_length",
             max_length=self.max_len,
@@ -167,12 +149,12 @@ class EssayDS(Dataset):
         return item
 
 
-def _qwk(y_true: np.ndarray, y_pred: np.ndarray, n_class: int) -> float:
+def _qwk(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return float(cohen_kappa_score(y_true, y_pred, weights="quadratic"))
 
 
 @torch.no_grad()
-def _eval_qwk_rmse(model, loader: DataLoader, device: torch.device, n_class: int) -> Tuple[float, float]:
+def _eval_qwk_rmse(model, loader: DataLoader, device: torch.device) -> Tuple[float, float]:
     model.eval()
     ys: List[np.ndarray] = []
     ps: List[np.ndarray] = []
@@ -184,150 +166,238 @@ def _eval_qwk_rmse(model, loader: DataLoader, device: torch.device, n_class: int
         pred = logits.argmax(-1).cpu().numpy()
         ys.append(batch["labels"].cpu().numpy())
         ps.append(pred)
-    
-    if not ys: return 0.0, 0.0
-    
+
+    if not ys:
+        return 0.0, 0.0
+
     y = np.concatenate(ys)
     p = np.concatenate(ps)
-    qwk = _qwk(y, p, n_class)
+    qwk = _qwk(y, p)
     rmse = float(np.sqrt(((p - y) ** 2).mean()))
     return qwk, rmse
 
 
 # =============================================================================
-# コアロジック (train_core)
+# Core
 # =============================================================================
-
 
 def train_core(
     split: DatasetSplit,
-    out_dir: Path,
+    ckpt_dir: ArtifactDir,
     cfg: Mapping[str, Any],
-    meta: Optional[Dict[str, Any]] = None,
     return_model: bool = False,
     save_checkpoints: bool = True,
 ) -> Tuple[int, Optional[Any]]:
     """
-    メモリ上のデータ (split) を用いて学習を実行するコア関数。
+    Strict Mode:
+      - cfg['run'/'data'/'model'/'train'] は必須
+      - cfg['data.text_key_primary'], cfg['data.label_key'], cfg['data.max_len'] は必須
+      - cfg['model.num_labels'], cfg['model.speed'] は必須
+      - cfg['train.lr_full or lr_frozen'], cfg['train.epochs'], cfg['train.batch_size'], cfg['train.patience'] は必須
+      - 安定化用に cfg['train.weight_decay'], cfg['train.warmup_ratio'], cfg['train.max_grad_norm'] も必須
     """
-    run_cfg = cfg.get("run", {})
-    data_cfg = cfg.get("data", {})
-    model_cfg = cfg.get("model", {})
-    train_cfg = cfg.get("train", {})
+    # ---- section presence ----
+    if "run" not in cfg:
+        raise KeyError("cfg missing 'run' section")
+    if "data" not in cfg:
+        raise KeyError("cfg missing 'data' section")
+    if "model" not in cfg:
+        raise KeyError("cfg missing 'model' section")
+    if "train" not in cfg:
+        raise KeyError("cfg missing 'train' section")
 
-    # out_dir の確保
-    out_dir.mkdir(parents=True, exist_ok=True)
+    run_cfg = cfg["run"]
+    data_cfg = cfg["data"]
+    model_cfg = cfg["model"]
+    train_cfg = cfg["train"]
 
-    text_key = data_cfg.get("text_key_primary", "mecab")
-    label_key = data_cfg.get("label_key", "score")
-    max_len = int(data_cfg.get("max_len", 128))
+    # ---- required keys ----
+    text_key = data_cfg["text_key_primary"]
+    label_key = data_cfg["label_key"]
+    max_len = int(data_cfg["max_len"])
 
-    seed = int(run_cfg.get("seed", 42))
+    speed = model_cfg["speed"]  # "full" or "frozen"
+    if "num_labels" not in model_cfg:
+        raise KeyError("Config 'model.num_labels' is required (Strict Mode).")
+    cfg_num_labels = int(model_cfg["num_labels"])
+
+    # optimization required keys
+    if "weight_decay" not in train_cfg:
+        raise KeyError("Config 'train.weight_decay' is required (e.g. 0.01).")
+    if "warmup_ratio" not in train_cfg:
+        raise KeyError("Config 'train.warmup_ratio' is required (e.g. 0.06).")
+    if "max_grad_norm" not in train_cfg:
+        raise KeyError("Config 'train.max_grad_norm' is required (e.g. 1.0).")
+
+    weight_decay = float(train_cfg["weight_decay"])
+    warmup_ratio = float(train_cfg["warmup_ratio"])
+    max_grad_norm = float(train_cfg["max_grad_norm"])
+    if not (0.0 <= warmup_ratio < 1.0):
+        raise ValueError(f"train.warmup_ratio must be in [0,1), got {warmup_ratio}")
+
+    # ---- seed ----
+    seed = int(run_cfg["seed"])
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # データの取得
+    # ---- data ----
     rows_tr_raw = split.labeled
     rows_dv_raw = split.dev
 
     if not rows_tr_raw:
         LOGGER.error("Missing labeled data.")
         return 1, None
-    
-    # ラベル正規化
+
     rows_tr, min_tr, max_tr = _normalize_labels(rows_tr_raw, label_key, "train/labeled")
     if rows_dv_raw:
         rows_dv, min_dv, max_dv = _normalize_labels(rows_dv_raw, label_key, "dev")
     else:
         rows_dv, min_dv, max_dv = [], None, None
 
+    LOGGER.info(
+        "Label Stats (Train/Labeled): n=%d min=%s max=%s; (Dev): n=%d min=%s max=%s",
+        len(rows_tr),
+        str(min_tr),
+        str(max_tr),
+        len(rows_dv),
+        str(min_dv),
+        str(max_dv),
+    )
+
     if not rows_tr:
-        LOGGER.error("No valid training data.")
+        LOGGER.error("No valid training data after normalization.")
         return 1, None
 
-    # クラス数決定ロジック
+    # ---- num_labels check ----
+    if min_tr is not None and min_tr < 0:
+        raise ValueError(f"Negative labels found in train: min={min_tr}")
+    if rows_dv and min_dv is not None and min_dv < 0:
+        raise ValueError(f"Negative labels found in dev: min={min_dv}")
+
     max_candidates = [v for v in (max_tr, max_dv) if v is not None]
     max_y = max(max_candidates) if max_candidates else 0
     n_class_data = int(max_y) + 1
 
-    cfg_num_labels_raw = model_cfg.get("num_labels")
-    cfg_num_labels: Optional[int] = None
-    if cfg_num_labels_raw is not None:
-        try:
-            cfg_num_labels = int(cfg_num_labels_raw)
-            if cfg_num_labels <= 0: cfg_num_labels = None
-        except: cfg_num_labels = None
+    if cfg_num_labels < n_class_data:
+        raise ValueError(
+            f"Config num_labels={cfg_num_labels} is smaller than actual data max label "
+            f"{n_class_data - 1} (requires {n_class_data})."
+        )
 
-    meta_num_labels: Optional[int] = None
-    if meta:
-        meta_num_labels_raw = meta.get("num_labels")
-        try:
-            if meta_num_labels_raw is not None:
-                meta_num_labels = int(meta_num_labels_raw)
-                if meta_num_labels <= 0: meta_num_labels = None
-        except: meta_num_labels = None
+    n_class = cfg_num_labels
 
-    n_class_candidates = [n_class_data]
-    if meta_num_labels is not None: n_class_candidates.append(meta_num_labels)
-    if cfg_num_labels is not None: n_class_candidates.append(cfg_num_labels)
-    n_class = max(n_class_candidates)
-    
-    # トークナイザ・モデル構築
+    # ---- model ----
     tok = create_tokenizer(cfg)
     model = create_model(cfg, n_class)
 
-    LOGGER.info(f"Analyzing token lengths (max_len={max_len})...")
+    # Sanity: speed vs freeze_base mismatch (common cause of "not learning")
+    base_trainable = any(p.requires_grad for n, p in model.named_parameters() if n.startswith("bert."))
+    if speed == "full" and not base_trainable:
+        raise ValueError(
+            "speed=full but base model parameters are frozen. "
+            "Set cfg.model.freeze_base=false OR use speed=frozen."
+        )
+    if speed == "frozen" and base_trainable:
+        raise ValueError(
+            "speed=frozen but base model parameters are trainable. "
+            "Set cfg.model.freeze_base=true OR use speed=full."
+        )
+
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    LOGGER.info("Trainable params: %s / %s (%.2f%%)", f"{trainable:,}", f"{total:,}", 100.0 * trainable / max(total, 1))
+
+    # Optional warm-start
+    if "init_ckpt" in train_cfg and train_cfg["init_ckpt"]:
+        init_path = str(train_cfg["init_ckpt"])
+        LOGGER.info("Warm-start: loading init_ckpt=%s", init_path)
+        state = torch.load(init_path, map_location="cpu")
+        sd = state.get("model", state) if isinstance(state, dict) else state
+        missing, unexpected = model.load_state_dict(sd, strict=False)
+        if missing:
+            LOGGER.warning("init_ckpt missing keys: %d (show up to 20): %s", len(missing), missing[:20])
+        if unexpected:
+            LOGGER.warning("init_ckpt unexpected keys: %d (show up to 20): %s", len(unexpected), unexpected[:20])
+
+    # ---- stats ----
+    LOGGER.info("Analyzing token lengths (max_len=%d)...", max_len)
     _analyze_token_lengths(rows_tr, tok, text_key, "Train")
     if rows_dv:
         _analyze_token_lengths(rows_dv, tok, text_key, "Dev")
 
-    speed = model_cfg.get("speed", "full")
-
+    # ---- loaders ----
     ds_tr = EssayDS(rows_tr, tok, text_key, label_key, max_len, with_label=True)
     ds_dv = EssayDS(rows_dv, tok, text_key, label_key, max_len, with_label=True)
 
-    bs = int(train_cfg.get("batch_size", 16))
+    bs = int(train_cfg["batch_size"])
     dl_tr = DataLoader(ds_tr, batch_size=bs, shuffle=True, num_workers=0)
     dl_dv = DataLoader(ds_dv, batch_size=bs, shuffle=False, num_workers=0)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    # Optimizer設定
+    # ---- optimizer ----
     if speed == "full":
-        opt = AdamW(model.parameters(), lr=float(train_cfg.get("lr_full", 2e-5)))
-    else:
-        # Frozen or FE_sklearn
+        lr = float(train_cfg["lr_full"])
+        opt = AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif speed == "frozen":
+        lr = float(train_cfg["lr_frozen"])
         params = filter(lambda p: p.requires_grad, model.parameters())
-        opt = AdamW(params, lr=float(train_cfg.get("lr_frozen", 5e-4)))
+        opt = AdamW(params, lr=lr, weight_decay=weight_decay)
+    else:
+        raise ValueError(f"Unknown speed mode: {speed}")
 
-    epochs = int(train_cfg.get("epochs", 5))
+    # ---- schedule ----
+    epochs = int(train_cfg["epochs"])
     total_steps = epochs * max(1, math.ceil(len(ds_tr) / bs))
+    warmup_steps = int(round(total_steps * warmup_ratio))
     sched = get_linear_schedule_with_warmup(
-        opt, num_warmup_steps=0, num_training_steps=total_steps
+        opt, num_warmup_steps=warmup_steps, num_training_steps=total_steps
     )
 
-    ckpt_dir = out_dir / "checkpoints_min"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    
-    best_qwk = -1.0
-    patience = int(train_cfg.get("patience", -1))
+    # ---- early stopping ----
+    patience = int(train_cfg["patience"])
     no_improve_cnt = 0
-    if patience > 0:
-        LOGGER.info(f"Early Stopping ENABLED: patience={patience}")
+    early_stop_min_epochs = int(train_cfg.get("early_stop_min_epochs", 0))
 
+    if patience > 0:
+        LOGGER.info("Early Stopping ENABLED: patience=%d", patience)
+
+    # ---- AMP ----
     AMP_ENABLED = device.type == "cuda"
-    AMP_DTYPE = torch.bfloat16
-    scaler = GradScaler(enabled=AMP_ENABLED)
+    AMP_DTYPE = torch.bfloat16  # default: bf16
+    scaler = GradScaler(enabled=(AMP_ENABLED and AMP_DTYPE == torch.float16))
 
     LOGGER.info(
-        f"Start training: out_dir={out_dir} n_class={n_class} speed={speed} "
-        f"device={device.type} epochs={epochs} batch_size={bs} max_len={max_len}"
+        "Start training: out_file=%s n_class=%d speed=%s device=%s epochs=%d batch_size=%d max_len=%d",
+        str(ckpt_dir),
+        n_class,
+        speed,
+        device.type,
+        epochs,
+        bs,
+        max_len,
     )
+    LOGGER.info(
+        "Optim: lr=%g weight_decay=%g warmup_steps=%d/%d max_grad_norm=%g AMP=%s dtype=%s scaler=%s",
+        lr,
+        weight_decay,
+        warmup_steps,
+        total_steps,
+        max_grad_norm,
+        AMP_ENABLED,
+        str(AMP_DTYPE),
+        scaler.is_enabled(),
+    )
+
+    best_qwk = -1.0
 
     for ep in range(1, epochs + 1):
         model.train()
+        train_loss_sum = 0.0
+        n_batches = 0
+
         for batch in dl_tr:
             for k, v in list(batch.items()):
                 if k != "labels" and hasattr(v, "to"):
@@ -338,126 +408,140 @@ def train_core(
             with autocast(device_type=device.type, enabled=AMP_ENABLED, dtype=AMP_DTYPE):
                 out = model(**{k: batch[k] for k in batch if k != "labels"}, labels=batch["labels"])
                 loss = out.loss
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+
+            train_loss_sum += float(loss.detach().cpu())
+            n_batches += 1
+
+            # backprop
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
+                clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                clip_grad_norm_(model.parameters(), max_grad_norm)
+                opt.step()
+
             sched.step()
 
-        # Validation
+        train_loss_avg = train_loss_sum / max(n_batches, 1)
+
+        # validation
         if rows_dv:
-            qwk, rmse = _eval_qwk_rmse(model, dl_dv, device, n_class)
-            LOGGER.info(f"Epoch {ep}/{epochs}: Dev QWK={qwk:.4f}, RMSE={rmse:.4f}")
-            
-            # Save Last (制御対象)
+            qwk, rmse = _eval_qwk_rmse(model, dl_dv, device)
+            LOGGER.info(
+                "Epoch %d/%d: TrainLoss=%.4f  Dev QWK=%.4f, RMSE=%.4f",
+                ep,
+                epochs,
+                train_loss_avg,
+                qwk,
+                rmse,
+            )
+
+            # save last
             if save_checkpoints:
-                torch.save(
-                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-                    ckpt_dir / "last.pt",
+                ckpt_dir.last.save_checkpoint(
+                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class}
                 )
-            
-            # Save Best & Early Stopping
+
+            # save best / early stop
             if qwk > best_qwk:
                 best_qwk = qwk
                 no_improve_cnt = 0
-                # Save Best (制御対象)
                 if save_checkpoints:
-                    torch.save(
-                        {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
-                        ckpt_dir / "best.pt",
+                    ckpt_dir.best.save_checkpoint(
+                        {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class}
                     )
             else:
-                if patience > 0:
+                if patience > 0 and ep >= early_stop_min_epochs:
                     no_improve_cnt += 1
                     if no_improve_cnt >= patience:
-                        LOGGER.info(f"Early stopping triggered at epoch {ep}")
+                        LOGGER.info("Early stopping triggered at epoch %d", ep)
                         break
         else:
-            LOGGER.info(f"Epoch {ep}/{epochs}: (No dev data)")
-            torch.save(
-                {"model": model.state_dict(), "epoch": ep, "n_class": n_class},
-                ckpt_dir / "best.pt",
-            )
+            LOGGER.info("Epoch %d/%d: TrainLoss=%.4f  (No dev data)", ep, epochs, train_loss_avg)
+            if save_checkpoints:
+                ckpt_dir.best.save_checkpoint(
+                    {"model": model.state_dict(), "epoch": ep, "n_class": n_class}
+                )
 
-    LOGGER.info(f"Training finished. Best QWK={best_qwk:.4f}")
+    LOGGER.info("Training finished. Best QWK=%.4f", best_qwk)
 
-    # インメモリ返却用ロジック
     if return_model:
-        best_ckpt_path = ckpt_dir / "best.pt"
-        if best_ckpt_path.exists():
+        # Prefer best checkpoint if exists; otherwise return current model.
+        if hasattr(ckpt_dir, "best") and ckpt_dir.best.exists():
             try:
-                state = torch.load(best_ckpt_path, map_location=device)
-                if "model" in state:
-                    model.load_state_dict(state["model"])
-                else:
-                    model.load_state_dict(state)
+                state = torch.load(ckpt_dir.best.path, map_location=device)
+                sd = state.get("model", state) if isinstance(state, dict) else state
+                model.load_state_dict(sd, strict=False)
                 model.eval()
                 LOGGER.info("Reloaded best model state for in-memory return.")
                 return 0, model
             except Exception as e:
-                LOGGER.error(f"Failed to reload best model: {e}")
+                LOGGER.error("Failed to reload best model: %s", e)
                 return 1, None
-        else:
-            model.eval()
-            return 0, model
+        model.eval()
+        return 0, model
 
     return 0, None
 
 
 # =============================================================================
-# CLI エントリポイント (run)
+# CLI (rarely used in this project; keep safe & explicit)
 # =============================================================================
-
 
 def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
     """
-    CLI 用ラッパー。
+    CLI wrapper (debug use).
+    Note: Pipeline/Task 経由の利用を推奨。単体CLI実行は ArtifactDir の構築が必要。
     """
-    if cfg is None and isinstance(argv, dict):
-        cfg = argv
-        argv = []
     if cfg is None:
-        raise ValueError("tensaku.train.run requires cfg dict")
+        raise ValueError("tensaku.train.run requires cfg dict (Strict Mode)")
 
-    run_cfg = cfg.get("run", {})
-    data_cfg = cfg.get("data", {})
-    
-    data_dir = run_cfg.get("data_dir")
-    if not data_dir:
-        LOGGER.error("run.data_dir is not set.")
-        return 1
+    run_cfg = cfg["run"]
+    data_dir = run_cfg["data_dir"]
 
-    files = data_cfg.get("files") or {}
-    fn_labeled = files.get("labeled") or files.get("train") or "labeled.jsonl"
-    path_tr = os.path.join(data_dir, fn_labeled)
-    path_dv = os.path.join(data_dir, files.get("dev", "dev.jsonl"))
+    data_cfg = cfg["data"]
+    # ここはプロジェクト運用上ほぼ使われないため、ファイル名は cfg 側で指定することを推奨。
+    files = data_cfg.get("files", {})
+    fn_labeled = files.get("labeled")
+    fn_dev = files.get("dev")
 
-    rows_tr = _read_jsonl(path_tr)
-    rows_dv = _read_jsonl(path_dv)
+    if not fn_labeled:
+        raise KeyError("cfg.data.files.labeled is required for CLI run()")
+    if not fn_dev:
+        raise KeyError("cfg.data.files.dev is required for CLI run()")
+
+    rows_tr = _read_jsonl(os.path.join(data_dir, fn_labeled))
+    rows_dv = _read_jsonl(os.path.join(data_dir, fn_dev))
 
     if not rows_tr:
-        LOGGER.error(f"Failed to load labeled data from {path_tr}")
+        LOGGER.error("Failed to load labeled data.")
         return 1
-    
-    meta = _load_meta_if_exists(data_dir)
 
-    split = DatasetSplit(
-        labeled=rows_tr,
-        dev=rows_dv,
-        test=[],
-        pool=[]
-    )
+    split = DatasetSplit(labeled=rows_tr, dev=rows_dv, test=[], pool=[])
 
-    out_dir_str = run_cfg.get("out_dir", "./outputs")
+    out_dir_str = run_cfg["out_dir"]
     out_dir = Path(out_dir_str)
 
-    # CLI実行時はモデル返却不要
-    ret, _ = train_core(split=split, out_dir=out_dir, cfg=cfg, meta=meta, return_model=False)
-    return ret
+    # Try constructing ArtifactDir in a compatible way (explicit + noisy on failure).
+    try:
+        ckpt_dir = ArtifactDir(out_dir)  # type: ignore[misc]
+    except TypeError:
+        try:
+            ckpt_dir = ArtifactDir(path=out_dir)  # type: ignore[call-arg]
+        except TypeError as e:
+            raise TypeError(
+                "Failed to construct ArtifactDir from run.out_dir. "
+                "Use pipeline/task execution, or adjust ArtifactDir constructor handling in train.run()."
+            ) from e
+
+    rc, _ = train_core(split=split, ckpt_dir=ckpt_dir, cfg=cfg, return_model=False)
+    return rc
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
-    LOGGER.info("Run via CLI: tensaku train -c <CFG.yaml>")
+    # Strict Mode: configなし起動は想定しない
+    pass

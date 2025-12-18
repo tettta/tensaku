@@ -1,2 +1,6 @@
-name: "kmeans"
+name: kmeans
 k_cluster: 200
+k: 200
+# round0 だけは明示的に別サンプラーにできる（例: msp / trust / random）
+round0: msp
+conf_key: msp

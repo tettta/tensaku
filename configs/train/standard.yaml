@@ -1,5 +1,11 @@
+# まずは安全側
+lr_full: 2.0e-5          # もし今もっと大きいなら、これが最重要
 epochs: 20
 batch_size: 16
-lr_full: 2.0e-05
-lr_frozen: 0.0005
-patience: 3
+weight_decay: 0.01
+warmup_ratio: 0.06
+max_grad_norm: 1.0
+
+# early stop は一旦ゆるめるの推奨
+early_stopping: true
+patience: 8

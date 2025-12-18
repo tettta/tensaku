@@ -1,14 +1,41 @@
-# configs/confidence/trust_v2.yaml
-
 estimators:
-  # 1. 基本的な推定器 (パラメータなし)
+  # 1. MSP (確率)
+  # 値: 0.0 ~ 1.0 (大きいほど自信あり)
   - name: msp
+    higher_is_better: true
+    cfg:
+      temperature: 1.0
+
+  # 2. Entropy (実装: 負のエントロピー)
+  # 実装が -H を返しているため、値が大きい(0に近い)ほど自信ありとなります。
   - name: entropy
-  
+    higher_is_better: true  # 【修正】実装に合わせて true に変更
+    cfg:
+      temperature: 1.0
+
+  # 3. Margin (Top1 - Top2)
+  # 差が大きいほど自信あり。
+  - name: margin
+    higher_is_better: true  # 【修正】差が大きい＝自信があるため true
+    cfg:
+      temperature: 1.0
+
+  # 4. Energy (LogSumExp)
+  # 実装では LogSumExp を返しており、値が大きいほど分布内(自信あり)。
+  - name: energy
+    higher_is_better: true
+    cfg:
+      temperature: 1.0
+
+  # 5. Trust Score
+  # 値: 0.0 ~ 1.0 (大きいほど信頼できる)
+  # パラメータは 'cfg' の中に入れる必要があります。
   - name: trust
-    version: v2
-    metric: cosine
-    k_list: [5]
-    agg: median
-    trim_q: 0.1
-    normalize: zscore
+    higher_is_better: true
+    cfg:  # 【修正】trust固有のパラメータは cfg 下に移動
+      version: v2
+      metric: cosine
+      k_list: [5]
+      agg: median
+      trim_q: 0.1
+      normalize: zscore

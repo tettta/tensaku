@@ -12,19 +12,54 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from tensaku.al.state import ALState, move_from_pool_to_labeled
 from tensaku.al.sampler import BaseSampler
+from tensaku.al.label_acquisition import acquire_labels
 
 
 LOGGER = logging.getLogger(__name__)
 
 
 def run_one_step(
+    *,
     state: ALState,
-    sampler: BaseSampler,
-    budget: int,
+    adapter: Any,
+    sampler: Optional[BaseSampler] = None,
+    budget: Optional[int] = None,
+    plan: Optional[Any] = None,
     scores: Optional[Mapping[Any, float]] = None,
+    features: Optional[Any] = None,
+    feature_ids: Optional[List[Any]] = None,
     as_new_round: bool = True,
 ) -> Tuple[ALState, List[Any]]:
-    if budget <= 0 or state.n_pool == 0:
+    """Run one AL step (STRICT).
+
+    Required contract
+    - `adapter.oracle_labels(ids)` must exist (enforced via `acquire_labels`).
+
+    Scheduling
+    - If `plan` is provided, it must supply `.sampler` and `.budget`.
+    - Otherwise `sampler` and `budget` must be provided.
+    """
+
+    if plan is not None:
+        if sampler is not None or budget is not None:
+            raise TypeError("Provide either plan=... OR (sampler=..., budget=...), not both.")
+
+        # Accept either a small dataclass (attributes) or a plain mapping.
+        if isinstance(plan, Mapping):
+            if "sampler" not in plan or "budget" not in plan:
+                raise TypeError("plan mapping must include keys: {'sampler','budget'}")
+            sampler = plan["sampler"]
+            budget = plan["budget"]
+        else:
+            sampler = getattr(plan, "sampler", None)
+            budget = getattr(plan, "budget", None)
+
+    if sampler is None:
+        raise TypeError("sampler is required (or provide plan.sampler).")
+    if budget is None:
+        raise TypeError("budget is required (or provide plan.budget).")
+
+    if int(budget) <= 0 or state.n_pool == 0:
         new_state = ALState(
             round_index=state.round_index + 1 if as_new_round else state.round_index,
             labeled_ids=list(state.labeled_ids),
@@ -34,7 +69,18 @@ def run_one_step(
         )
         return new_state, []
 
-    selected_ids = sampler.select(state=state, scores=scores, budget=budget)
+    selected_ids = sampler.select(
+        state=state,
+        scores=scores,
+        budget=int(budget),
+        features=features,
+        feature_ids=feature_ids,
+    )
+
+    # STRICT: sampling後に必ずラベルを取得（round0分岐なし）
+    # ここで missing があれば即エラーにして、以降のラウンド更新を止める。
+    _ = acquire_labels(adapter=adapter, ids=list(selected_ids))
+
     new_state = move_from_pool_to_labeled(
         state=state,
         selected_ids=selected_ids,
@@ -45,6 +91,7 @@ def run_one_step(
 
 def run_loop(
     initial_state: ALState,
+    adapter: Any,
     sampler: BaseSampler,
     rounds: int,
     budget: int,
@@ -64,6 +111,7 @@ def run_loop(
 
         new_state, selected_ids = run_one_step(
             state=state,
+            adapter=adapter,
             sampler=sampler,
             budget=budget,
             scores=scores,

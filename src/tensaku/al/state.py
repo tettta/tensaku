@@ -119,6 +119,50 @@ class ALState:
             "n_test": self.n_test,
             "coverage": self.coverage,
         }
+    
+
+    def to_dataset_split(self, base_split: DatasetSplit, *, id_key: str = "id") -> DatasetSplit:
+        """
+        base_split（元の DatasetSplit）から、現在の state が示す ID 集合に従って
+        labeled/pool/dev/test を射影した DatasetSplit を返す（in-memory 変換）。
+
+        Strict:
+          - base_split 内の各 record は必ず id_key を持つこと。
+          - state が持つ ID が base_split 側で見つからない場合は不整合として例外。
+        """
+        def _filter(records, allowed_ids, split_name: str):
+            allowed_set = set(allowed_ids)
+            found_set = set()
+            out = []
+
+            for rec in records:
+                if not isinstance(rec, Mapping):
+                    raise TypeError(f"{split_name} contains non-mapping record: {type(rec)}")
+                if id_key not in rec:
+                    raise KeyError(f"{split_name} record missing id_key '{id_key}'")
+                rid = rec[id_key]
+                if rid in allowed_set:
+                    out.append(rec)
+                    found_set.add(rid)
+
+            missing = allowed_set - found_set
+            if missing:
+                # state と base_split が食い違っている（IDが存在しない）
+                sample = list(missing)[:5]
+                raise RuntimeError(
+                    f"ALState/base_split mismatch in {split_name}: "
+                    f"{len(missing)} ids not found (e.g. {sample})"
+                )
+            return out
+
+        # state が dev/test を管理していないケースもあり得るので、その場合は base をそのまま使う
+        labeled = _filter(base_split.labeled, self.labeled_ids, "labeled") if self.labeled_ids else list(base_split.labeled)
+        pool = _filter(base_split.pool, self.pool_ids, "pool") if self.pool_ids else list(base_split.pool)
+
+        dev = _filter(base_split.dev, self.dev_ids, "dev") if self.dev_ids else list(base_split.dev)
+        test = _filter(base_split.test, self.test_ids, "test") if self.test_ids else list(base_split.test)
+
+        return DatasetSplit(labeled=labeled, dev=dev, test=test, pool=pool)
 
 
 # ======================================================================

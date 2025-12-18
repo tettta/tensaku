@@ -1,0 +1,9 @@
+# configs/cleaner/keep_ckpt.yaml
+# Example preset: delete arrays/logits/embs but keep checkpoints & predictions
+round_end:
+  enabled: true
+  kinds: [array, logit, emb]
+
+experiment_end:
+  enabled: false
+  kinds: []

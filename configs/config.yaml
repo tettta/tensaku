@@ -1,7 +1,7 @@
 # configs/config.yaml
-
 defaults:
   - _self_
+  - qid: Y14_1-2_1_3  # デフォルト QID を指定
   - al: base           # al/trust.yaml を使用
   - model: bert         # model/bert.yaml を使用
   - train: standard     # train/standard.yaml を使用
@@ -11,36 +11,48 @@ defaults:
   - confidence: default # confidence/default.yaml を使用
   - gate: default       # gate/default.yaml を使用
   - run: base           # run/base.yaml を使用（中身はAL専用の共通設定）
-  - cleanup: base       # cleanup/base.yaml を使用
+  - cleaner: base       # cleaner/base.yaml
   - task: sas           # task/sas.yaml を使用
 
 hydra:
-  # 単発実行時（--multirun じゃないとき）の作業ディレクトリ
   run:
-    dir: outputs/${data.qid}/single_run/${now:%Y-%m-%d_%H-%M-%S}
+    # 【変更】override_dirname を sampler の前に持ってくる
+    dir: ${run.outputs_root}/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
 
-  # --multirun 時の設定
   sweep:
-    # マルチラン全体のルート（必ず文字列にすること）
     dir: .
-    # 1ジョブごとのサブディレクトリ
-    # 例: ./outputs/Y14_1-2_1_3/sampler=trust,budget=50/seed=1
-    subdir: outputs/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
-
-  # 各ジョブ配下に .hydra/config を置く場所
-  output_subdir: config
+    
+    subdir: ${run.outputs_root}/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
 
   job:
-    chdir: true
     config:
       override_dirname:
-        # override_dirname から除外したいキー
-        # （パスの別レイヤーで管理するもの）
+
+        # 【重要】ここに書いたキーはフォルダ名（override）に含まれなくなります。
+        # 逆に言えば、ここに書いていないパラメータ（al.budgetなど）を変更するとフォルダ名になります。
         exclude_keys:
+          # --- パスとして既に存在するもの ---
           - run.seed
           - data.qid
+          - al.sampler.name
+          - al/sampler # これを除外しないと、フォルダ名に "al.sampler=trust" が混ざってしまいます
+
+          # --- 設定グループ（Config Groups） ---
+          # これらを除外しないと "run=standard" 等がフォルダ名に付いて長くなりすぎます
+          - run
+          - train
+          - model
+          - al
+          - infer
+          - data
+          - split
+          - confidence
+          - gate
+          - cleaner
+          - task
+          - dataset
+          
+          # --- 制御用変数 ---
           - run.on_exist
           - run.out_dir
           - run.data_dir
-          - al/sampler
-          - al.sampler.name

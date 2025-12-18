@@ -1,221 +1,164 @@
 # /home/esakit25/work/tensaku/src/tensaku/pipelines/hitl.py
 # -*- coding: utf-8 -*-
 """tensaku.pipelines.hitl
-==========================
 
-@module: tensaku.pipelines.hitl
-@role  : 予測結果 (preds_detail 相当の DataFrame) と gate 設定から、
-         gate_core を用いて HITL 閾値探索と適用を行う配列ベースのパイプライン。
+HITL pipeline primitive: given a detail DataFrame (preds + conf), find tau on dev and
+apply it to other splits (test/pool).
 
-@overview:
-    - preds_detail 相当の DataFrame を入力として受け取る（ファイル I/O は行わない）。
-    - 呼び出し元から渡された「具体的な確信度列名 (`conf_column_name`)」と
-      「Gate設定 (`gate_cfg`)」に基づいて計算を行う。
-    - ファイルパスや実験全体の `cfg` 構造には依存しない（Pure Logic）。
+This module is still a *lower* module, but is intentionally lightweight and
+in-memory oriented:
+- Inputs/outputs are DataFrames and small numpy arrays.
+- Saving is handled by upper orchestrators (tasks/pipelines) via layout/fs_core.
 
-@inputs:
-    - pandas.DataFrame: `split`, `y_true`, `y_pred` および指定された確信度列を含む表。
-    - gate_cfg (Mapping): GateConfig を構築するための辞書 (eps_cse, cse_abs_err 等)。
-    - conf_column_name (str): DataFrame 内の確信度列の名前 (例: "conf_trust")。
-
-@outputs:
-    - HitlOutputs: tau, dev/test/pool の GateResult をまとめた dataclass。
-
-@notes:
-    - Phase2 改修: 以前の `_choose_conf_column` 等のタスク固有マッピングロジックは廃止。
-      列名の解決は呼び出し元 (Task層) の責務とする。
+Strict notes
+- Required columns must exist; missing columns raise immediately.
+- No cfg mutation.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, List, Dict, Mapping, Optional
 
+import numpy as np
 import pandas as pd
 
-from tensaku.gate import (
-    GateConfig,
-    GateInputs,
-    GateDevResult,
-    GateApplyResult,
-    find_tau_for_constraint,
-    apply_tau,
-)
-
-LOGGER = logging.getLogger(__name__)
-
-
-# =====================================================================
-# dataclasses
-# =====================================================================
+from tensaku.gate import GateApplyResult, GateDevResult, GateInputs, apply_tau, create_gate_config, find_tau_for_constraint
 
 
 @dataclass
 class HitlOutputs:
-    """gate_core による HITL 結果をまとめたコンテナ。"""
-
-    conf_column_name: str
-    tau: Optional[float]
     dev: GateDevResult
     test: Optional[GateApplyResult]
     pool: Optional[GateApplyResult]
 
-    def to_summary_dict(self) -> Dict[str, Any]:
-        """簡易的な要約 dict を返すユーティリティ。"""
-        row: Dict[str, Any] = {
-            "conf_column": self.conf_column_name,
-            "tau": self.tau,
-        }
+    def to_summary_dict(self, *, prefix: str = "") -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        p = prefix or ""
+        out[p + "tau"] = self.dev.tau
+        out[p + "dev.coverage"] = self.dev.coverage
+        out[p + "dev.cse"] = self.dev.cse
+        out[p + "dev.rmse"] = self.dev.rmse
 
-        # dev
-        row.update(
+        if self.test is not None:
+            out[p + "test.coverage"] = self.test.coverage
+            out[p + "test.cse"] = self.test.cse
+            out[p + "test.rmse"] = self.test.rmse
+        if self.pool is not None:
+            out[p + "pool.coverage"] = self.pool.coverage
+            out[p + "pool.cse"] = self.pool.cse
+            out[p + "pool.rmse"] = self.pool.rmse
+        return out
+
+    def assign_df(self) -> pd.DataFrame:
+        """Return pool assignment as a DataFrame with columns [is_auto, is_human]."""
+        if self.pool is None:
+            return pd.DataFrame(columns=["is_auto", "is_human"])
+        return pd.DataFrame(
             {
-                "dev_coverage_auto": self.dev.coverage,
-                "dev_cse_auto": self.dev.cse,
-                "dev_rmse_auto": self.dev.rmse,
+                "is_auto": self.pool.mask_auto.astype(bool),
+                "is_human": self.pool.mask_human.astype(bool),
             }
         )
 
-        # test
-        if self.test is not None:
-            row.update(
-                {
-                    "test_coverage_auto": self.test.coverage,
-                    "test_cse_auto": self.test.cse,
-                    "test_rmse_auto": self.test.rmse,
-                }
-            )
 
-        # pool
-        if self.pool is not None:
-            row.update(
-                {
-                    "pool_coverage_auto": self.pool.coverage,
-                    "pool_cse_auto": self.pool.cse,
-                    "pool_rmse_auto": self.pool.rmse,
-                }
-            )
-
-        return row
-
-
-# =====================================================================
-# 内部ユーティリティ
-# =====================================================================
-
-
-def _extract_gate_inputs(df: pd.DataFrame, col_conf: str) -> GateInputs:
-    """preds_detail 形式の DataFrame から GateInputs を構築する。"""
-    required = {"y_true", "y_pred", col_conf}
-    missing = required - set(df.columns)
+def _require_cols(df: pd.DataFrame, cols: list[str]) -> None:
+    missing = [c for c in cols if c not in df.columns]
     if missing:
-        raise ValueError(f"[hitl] 必須列が不足しています: {missing} (必要: {required})")
+        raise KeyError(f"hitl: missing required columns: {missing}")
+    
 
-    y_true = df["y_true"].to_numpy()
-    y_pred = df["y_pred"].to_numpy()
-    conf = df[col_conf].to_numpy()
-
-    # id がある場合は ids として渡す
-    ids = df["id"].to_numpy() if "id" in df.columns else None
-    return GateInputs(y_true=y_true, y_pred=y_pred, conf=conf, ids=ids)
-
-
-def _coerce_gate_config(cfg: Mapping[str, Any]) -> GateConfig:
-    """辞書から GateConfig を構築する。"""
-    # cfg が既に GateConfig の場合もあり得るが、ここでは Mapping を想定
-    eps_cse = float(cfg.get("eps_cse", 0.05))
-    cse_abs_err = int(cfg.get("cse_abs_err", 2))
-    higher_is_better = bool(cfg.get("higher_is_better", True))
-    return GateConfig(
-        eps_cse=eps_cse, cse_abs_err=cse_abs_err, higher_is_better=higher_is_better
-    )
-
-
-# =====================================================================
-# 公開 API
-# =====================================================================
-
-
-def run_hitl_from_detail_df(
-    df: pd.DataFrame,
-    gate_cfg: Mapping[str, Any],
-    conf_column_name: str,
-) -> HitlOutputs:
-    """preds_detail 形式の DataFrame と Gate設定から HITL ゲート処理を実行する。
-
-    Parameters
-    ----------
-    df:
-        preds_detail 形式の DataFrame。
-        必須列: 'split', 'y_true', 'y_pred', および conf_column_name で指定される列。
-    gate_cfg:
-        GateConfig 用の設定辞書。
-        キー例: "eps_cse", "cse_abs_err", "higher_is_better"
-    conf_column_name:
-        使用する確信度列の具体的な名前 (例: "conf_trust", "conf_msp")。
-        呼び出し元で解決済みの名前を渡すこと。
-
-    Returns
-    -------
-    HitlOutputs
-        tau, dev/test/pool の GateResult をまとめたコンテナ。
+def build_gate_assign_df(*, pool_ids: List[Any], conf_key: str, hitl_out: HitlOutputs) -> pd.DataFrame:
     """
-    if "split" not in df.columns:
-        raise ValueError(
-            "[hitl] DataFrame に 'split' 列が存在しません。dev/test/pool の判別に必要です。"
-        )
+    Build long-format gate assignment DF for pool.
+    Columns: id, split, conf_key, tau, is_auto, is_human
 
-    # 確信度列の存在確認
-    if conf_column_name not in df.columns:
-        raise ValueError(
-            f"[hitl] 指定された確信度列 '{conf_column_name}' が DataFrame に存在しません。\n"
-            f"  利用可能な列: {list(df.columns)}"
-        )
+    Important: normalize tau None -> np.nan (float) to avoid pandas concat FutureWarning.
+    """
+    assign = hitl_out.assign_df()
+    if len(assign) != len(pool_ids):
+        raise RuntimeError(f"Gate assign length mismatch: assign={len(assign)} pool_ids={len(pool_ids)}")
 
-    # split ごとに DataFrame を分割
-    dev_df = df[df["split"] == "dev"]
-    test_df = df[df["split"] == "test"]
-    pool_df = df[df["split"] == "pool"] if (df["split"] == "pool").any() else None
+    tau = hitl_out.dev.tau
+    tau_val = float(tau) if tau is not None else float("nan")  # <-- 핵: None を nan に
 
-    if dev_df.empty:
-        raise ValueError("[hitl] dev split が空です。tau 探索には dev データが必要です。")
+    out = assign.copy()
+    out.insert(0, "id", pool_ids)
+    out.insert(1, "split", "pool")
+    out.insert(2, "conf_key", conf_key)
+    out.insert(3, "tau", tau_val)
 
-    # GateConfig 構築
-    gc = _coerce_gate_config(gate_cfg)
+    # dtype 安定化（将来のpandas差分にも強くする）
+    out["tau"] = out["tau"].astype(float)
+    out["is_auto"] = out["is_auto"].astype(bool)
+    out["is_human"] = out["is_human"].astype(bool)
+    return out
 
-    # 1. dev で tau を探索
-    dev_inputs = _extract_gate_inputs(dev_df, conf_column_name)
-    dev_res = find_tau_for_constraint(dev_inputs, gc)
 
-    if dev_res.tau is None:
-        LOGGER.warning("[hitl] 条件を満たす tau が見つかりませんでした (dev)。")
-        return HitlOutputs(
-            conf_column_name=conf_column_name,
-            tau=None,
-            dev=dev_res,
-            test=None,
-            pool=None,
-        )
+def create_empty_gate_assign_df() -> pd.DataFrame:
+    """Gate割り当て結果の空スキーマを返す。"""
+    return pd.DataFrame(columns=["id", "split", "conf_key", "tau", "is_auto", "is_human"])  
 
-    tau = dev_res.tau
 
-    # 2. test への適用
-    test_res: Optional[GateApplyResult] = None
-    if test_df is not None and not test_df.empty:
-        test_inputs = _extract_gate_inputs(test_df, conf_column_name)
-        test_res = apply_tau(test_inputs, tau, gc)
+def run_hitl_from_detail_df(*, df: pd.DataFrame, gate_cfg: Mapping[str, Any], conf_column_name: str) -> HitlOutputs:
+    """Run HITL (dev->tau, apply to test/pool).
 
-    # 3. pool への適用
-    pool_res: Optional[GateApplyResult] = None
-    if pool_df is not None and not pool_df.empty:
-        pool_inputs = _extract_gate_inputs(pool_df, conf_column_name)
-        pool_res = apply_tau(pool_inputs, tau, gc)
+    Expected df columns:
+      - split: str in {labeled, dev, test, pool}
+      - y_true: int (dev/test) (pool may be NaN)
+      - y_pred: int
+      - conf_*: float confidence column
 
-    return HitlOutputs(
-        conf_column_name=conf_column_name,
-        tau=tau,
-        dev=dev_res,
-        test=test_res,
-        pool=pool_res,
-    )
+    gate_cfg: Mapping with required GateConfig keys:
+      - eps_cse, cse_abs_err, higher_is_better, steps
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise TypeError("df must be a pandas DataFrame")
+
+    _require_cols(df, ["split", "y_pred", conf_column_name])
+    # dev/test require y_true; pool may be NaN but column must exist for gate functions
+    _require_cols(df, ["y_true"])
+
+    cfg_gate = create_gate_config(gate_cfg)
+
+    # ----------------
+    # DEV: search tau
+    # ----------------
+    df_dev = df[df["split"] == "dev"]
+    if len(df_dev) == 0:
+        raise ValueError("hitl requires at least one dev sample to search tau")
+
+    y_true_dev = df_dev["y_true"].to_numpy()
+    y_pred_dev = df_dev["y_pred"].to_numpy()
+    conf_dev = df_dev[conf_column_name].to_numpy()
+
+    dev_in = GateInputs(y_true=y_true_dev, y_pred=y_pred_dev, conf=conf_dev, ids=None)
+    dev_out = find_tau_for_constraint(dev=dev_in, cfg=cfg_gate)
+
+    # ----------------
+    # TEST: apply tau
+    # ----------------
+    df_test = df[df["split"] == "test"]
+    test_out: Optional[GateApplyResult] = None
+    if len(df_test) > 0:
+        y_true_test = df_test["y_true"].to_numpy()
+        y_pred_test = df_test["y_pred"].to_numpy()
+        conf_test = df_test[conf_column_name].to_numpy()
+        te_in = GateInputs(y_true=y_true_test, y_pred=y_pred_test, conf=conf_test, ids=None)
+        test_out = apply_tau(inputs=te_in, cfg=cfg_gate, tau=dev_out.tau)
+
+    # ----------------
+    # POOL: apply tau (no gold; only masks are meaningful)
+    # ----------------
+    df_pool = df[df["split"] == "pool"]
+    pool_out: Optional[GateApplyResult] = None
+    if len(df_pool) > 0:
+        conf_pool = df_pool[conf_column_name].to_numpy()
+        # dummy arrays for shape compatibility
+        y_dummy = np.zeros_like(conf_pool, dtype=int)
+        po_in = GateInputs(y_true=y_dummy, y_pred=y_dummy, conf=conf_pool, ids=None)
+        pool_out = apply_tau(inputs=po_in, cfg=cfg_gate, tau=dev_out.tau)
+        pool_out.cse = float("nan")
+        pool_out.rmse = float("nan")
+
+    return HitlOutputs(dev=dev_out, test=test_out, pool=pool_out)

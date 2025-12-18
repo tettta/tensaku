@@ -1,405 +1,237 @@
 # /home/esakit25/work/tensaku/src/tensaku/pipelines/al.py
 # -*- coding: utf-8 -*-
-"""
-@module: tensaku.pipelines.al
-@role  : Active Learning (AL) 実験パイプラインのエントリポイント
-@overview:
-    - cfg（YAML + --set 済み）を受け取り、1 本の AL 実験を実行する。
-    - データ層 / タスク層 / AL層 を組み合わせて、ラウンドごとにループを回す。
-    - Task から返された pool_scores を Sampler に渡すことで、
-      不確実性サンプリング等を実現する。
+"""tensaku.pipelines.al
+
+@role:
+  - Run Active Learning (AL) loop.
+  - Keep orchestration thin: delegate dataset I/O to adapter, training/inference/confidence to task,
+    and selection+label acquisition to tensaku.al.loop.
+
+Design:
+  - Lower modules (adapter/task/al.loop) receive full cfg (Mapping) and read their needed sections.
+  - No fallback: required cfg keys must exist.
 """
 
 from __future__ import annotations
 
-import sys
-import csv
-import json
 import logging
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional, Sequence
 import shutil
+from pathlib import Path
+from typing import Any, Dict, List, Mapping, Optional
 
-import yaml  # PyYAML
-
-from tensaku.utils.cleaner import cleanup_round_delayed, cleanup_post_experiment
-from tensaku.experiments.layout import ExperimentLayout
-from tensaku.data.base import DatasetSplit, create_adapter
-from tensaku.tasks.base import BaseTask, TaskOutputs, create_task
-from tensaku.al.state import ALState, init_state_from_split
-from tensaku.al.sampler import create_sampler
+from tensaku.data.base import create_adapter
 from tensaku.al.loop import run_one_step
+from tensaku.al.label_acquisition import acquire_labels
+from tensaku.al.schedule import create_scheduler
+from tensaku.al.state import ALState, init_state_from_split
+from tensaku.experiments.layout import ExperimentLayout
+from tensaku.utils.strict_cfg import require_mapping, require_str
+from tensaku.utils.cleaner import clean_round_end, clean_experiment_end
+from tensaku.tasks.base import create_task
 
 
-# ======================================================================
-# ロガー (Hydra対応版)
-# ======================================================================
+LOGGER = logging.getLogger(__name__)
 
-def _setup_logger(verbose: bool = True) -> logging.Logger:
-    """
-    パイプライン用のロガーをセットアップする。
+
+def run_experiment(cfg: Mapping[str, Any]) -> int:
+    cfg_dict = dict(cfg)
+
+    out_root = Path(require_str(cfg_dict, ("run", "out_dir"), ctx="cfg.run"))
+    out_root.mkdir(parents=True, exist_ok=True)
+    layout = ExperimentLayout(root=out_root)
+
+    adapter = create_adapter(cfg_dict)
+
+    qid = require_str(cfg_dict, ("data", "qid"), ctx="cfg.data")
+    id_key = require_str(cfg_dict, ("data", "id_key"), ctx="cfg.data")
+    # ラベル注入のためにキー名を取得
+    label_key = require_str(cfg_dict, ("data", "label_key"), ctx="cfg.data")
+
+    split0 = adapter.make_initial_split()
+
+    task = create_task(cfg=cfg_dict, adapter=adapter, layout=layout)
+
+    al_cfg = require_mapping(cfg_dict, ("al",), ctx="cfg")
+    rounds = int(al_cfg["rounds"])
+    budget = int(al_cfg["budget"])
+
+    state: ALState = init_state_from_split(split0, id_key=id_key, round_index=0)
     
-    Note:
-        Hydraが既に root ロガーに対して FileHandler (main.log) と 
-        StreamHandler (コンソール) を設定しているため、
-        ここでは独自にハンドラを追加せず、ログレベルの調整のみを行う。
-        これによりログの二重出力を防ぐ。
-    """
-    # パッケージルートのロガー名
-    LOGGER_NAME = "tensaku"
-    
-    # パイプライン用モジュールロガーを取得
-    logger = logging.getLogger(f"{LOGGER_NAME}.pipelines.al")
-    
-    # ログレベルを設定
-    if verbose:
-        logger.setLevel(logging.INFO)
-    else:
-        logger.setLevel(logging.WARNING)
+    scheduler = create_scheduler(al_cfg)
 
-    return logger
+    _init_al_history(layout, state=state)
 
+    all_selected_rows: List[Dict[str, Any]] = []
 
-# ======================================================================
-# config / meta ダンプ
-# ======================================================================
-
-
-def _dump_exp_config(layout: ExperimentLayout, cfg: Mapping[str, Any]) -> None:
-    """有効設定 cfg を YAML として保存する。"""
-    path = layout.path_exp_config()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(dict(cfg), f, allow_unicode=True, sort_keys=False)
-
-
-def _dump_run_meta(
-    layout: ExperimentLayout,
-    cfg: Mapping[str, Any],
-    argv: Optional[List[str]] = None,
-) -> None:
-    """実行時メタ情報を JSON として保存する。
-
-    再現性向上のため、実行時のコマンドライン引数 (argv) も保存する。
-    """
-    run_cfg = cfg.get("run", {})
-    experiment: Optional[str] = run_cfg.get("experiment")
-    run_name: Optional[str] = run_cfg.get("name")
-
-    meta: Dict[str, Any] = {
-        "started_at": datetime.now().astimezone().isoformat(),
-        "experiment": experiment,
-        "run_name": run_name,
-        "qid": cfg.get("data", {}).get("qid"),
-        "out_dir": str(layout.root),
-    }
-
-    if argv is not None:
-        # argv は JSON シリアライズしやすいように list[str] として保持
-        meta["argv"] = list(argv)
-
-    path = layout.path_run_meta()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-
-
-# ======================================================================
-# DatasetSplit / ALState 変換ユーティリティ
-# ======================================================================
-
-
-def _build_record_index(
-    split: DatasetSplit,
-    id_key: str = "id",
-) -> Dict[Any, Mapping[str, Any]]:
-    """DatasetSplit 全体から id -> record のインデックスを構築する。"""
-    index: Dict[Any, Mapping[str, Any]] = {}
-
-    def _add(records: Sequence[Mapping[str, Any]]) -> None:
-        for rec in records:
-            if not isinstance(rec, Mapping):
-                continue
-            if id_key in rec:
-                index[rec[id_key]] = rec
-
-    _add(split.labeled)
-    _add(split.dev)
-    _add(split.test)
-    _add(split.pool)
-
-    return index
-
-
-def _split_from_state(
-    state: ALState,
-    index: Mapping[Any, Mapping[str, Any]],
-) -> DatasetSplit:
-    """ALState の ID 集合から、DatasetSplit を再構築する。"""
-
-    def _lookup(ids: Sequence[Any]):
-        return [index[i] for i in ids if i in index]
-
-    labeled = _lookup(state.labeled_ids)
-    dev = _lookup(state.dev_ids)
-    test = _lookup(state.test_ids)
-    pool = _lookup(state.pool_ids)
-
-    return DatasetSplit(
-        labeled=labeled,
-        dev=dev,
-        test=test,
-        pool=pool,
-    )
-
-
-# ======================================================================
-# al_history.csv の追記
-# ======================================================================
-
-
-def _append_al_history(
-    layout: ExperimentLayout,
-    round_index: int,
-    prev_state: ALState,
-    new_state: ALState,
-    metrics: Dict[str, Any],
-) -> None:
-    """
-    metrics/al_history.csv に 1 行追記する。
-    Task から返された metrics も統合して記録する。
-    """
-    path = layout.path_metrics_al_history()
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    added = new_state.n_labeled - prev_state.n_labeled
-    coverage = new_state.coverage
-
-    # 基本カラム
-    base_row = {
-        "round": round_index,
-        "n_labeled": new_state.n_labeled,
-        "n_pool": new_state.n_pool,
-        "added": added,
-        "coverage": f"{coverage:.6f}",
-    }
-
-    # Task metrics をマージ (競合時は Task 優先)
-    row = {**base_row, **metrics}
-
-    file_exists = path.exists()
-    fieldnames = list(row.keys())
-
-    with path.open("a", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not file_exists:
-            writer.writeheader()
-        # 既存ファイルがある場合、ヘッダ不一致のリスクがあるが今回は許容
-        writer.writerow(row)
-
-
-# ======================================================================
-# メイン: AL 実験 1 本を実行
-# ======================================================================
-
-
-def run_experiment(
-    cfg: Mapping[str, Any],
-    argv: Optional[List[str]] = None,
-) -> int:
-    """
-    Hydra対応版 run_experiment
-    """
-    
-    # ------------------------------------------------------------------
-    # 1. パスとレイアウトの解決
-    # ------------------------------------------------------------------
-    # Hydraが既にディレクトリを作って移動してくれているので、
-    # ルートは「カレントディレクトリ (.)」とする。
-    
-    current_dir = Path.cwd()
-    print(f"[AL] Running in Hydra directory: {current_dir}")
-
-    # 既存の cfg["run"]["out_dir"] を上書き（layout.py がこれを参照するため）
-    # ※ cfg が DictConfig の場合もあるが、マッピングとして操作
-    if "run" not in cfg:
-        cfg["run"] = {}
-    cfg["run"]["out_dir"] = str(current_dir)
-
-    # レイアウト構築 
-    layout = ExperimentLayout.from_cfg(cfg) 
-    layout.ensure_all_dirs()
-
-    # ------------------------------------------------------------------
-    # 2. ロガー準備 (Hydra対応)
-    # ------------------------------------------------------------------
-    # パス引数は渡さない
-    logger = _setup_logger(verbose=True)
-
-    # ------------------------------------------------------------------
-    # 3. 実験開始
-    # ------------------------------------------------------------------
-    _dump_exp_config(layout, cfg)
-    _dump_run_meta(layout, cfg, argv=argv)
-
-    logger.info(f"Experiment Started in: {layout.root}")
-
-    # 4) DatasetAdapter を構築し、初期 DatasetSplit を取得
-    try:
-        adapter = create_adapter(cfg)
-        logger.info("DatasetAdapter: %s", adapter.__class__.__name__)
-        split0: DatasetSplit = adapter.make_initial_split()
-    except Exception:
-        logger.exception("Dataset initialization failed.")
-        return 1
-
-    logger.info(
-        "Initial DatasetSplit sizes: labeled=%d, dev=%d, test=%d, pool=%d",
-        len(split0.labeled),
-        len(split0.dev),
-        len(split0.test),
-        len(split0.pool),
-    )
-
-    # 5) ALState と id->record index を構築
-    id_key = getattr(adapter, "id_key", "id")
-    state = init_state_from_split(split0, id_key=id_key, round_index=0)
-    index = _build_record_index(split0, id_key=id_key)
-    logger.info(
-        "ALState initialized: n_labeled=%d, n_pool=%d, total_n=%d",
-        state.n_labeled,
-        state.n_pool,
-        state.total_n,
-    )
-
-    # 6) Task と Sampler を構築
-    try:
-        task: BaseTask = create_task(cfg=cfg, adapter=adapter, layout=layout)
-        logger.info(
-            "Task: %s (name=%s)",
-            task.__class__.__name__,
-            getattr(task, "name", "?"),
-        )
-
-        sampler = create_sampler(cfg)
-        logger.info(
-            "Sampler: %s (name=%s)",
-            sampler.__class__.__name__,
-            getattr(sampler, "name", "?"),
-        )
-    except Exception:
-        logger.exception("Task or Sampler initialization failed.")
-        return 1
-
-    al_cfg = cfg.get("al", {})
-    rounds = int(al_cfg.get("rounds", 1))
-    budget = int(al_cfg.get("budget", 0))
-
-    # 停止条件: pool が空になったら止めるか？
-    stop_when_pool_empty = bool(al_cfg.get("stop_when_pool_empty", True))
-
-    logger.info("AL rounds = %d, budget per round = %d", rounds, budget)
-    if stop_when_pool_empty:
-        logger.info("AL stop condition: stop_when_pool_empty=True")
-
-
-    # 7) ラウンドループ
-    last_round_executed: Optional[int] = None
     for r in range(rounds):
-        logger.info("=== [round %d] ===", r)
+        LOGGER.info("=== [Round %d] Start ===", r)
 
-        # (a) Task 実行
-        split_r = _split_from_state(state, index)
-        try:
-            out: TaskOutputs = task.run_round(round_index=r, split=split_r)
-        except Exception:
-            logger.exception("Task.run_round failed at round %d", r)
-            return 1
+        # 1. Split構築 (Universe対応版)
+        split_r = _split_from_state(split0, state=state, id_key=id_key)
 
-        if out.metrics:
-            logger.info("  Task metrics: %s", out.metrics)
+        # 2. ラベル注入 (Label Injection)
+        # Pool 由来の行には label_key が無い（＝未ラベル）ので、Oracle で補完する。
+        # 既に label_key を持つ行は上書きしない。不一致があればデータ不整合なので即エラー。
+        all_labeled_ids = list(state.labeled_ids)
+        labels_map = acquire_labels(adapter=adapter, ids=all_labeled_ids)
 
-        # (b) Sampling (pool -> labeled)
-        #     Task から返された pool_scores を sampler に渡す
-        new_state, selected_ids = run_one_step(
+        missing_in_oracle = []
+        mismatched = []
+
+        for row in split_r.labeled:
+            rid = row.get(id_key)
+            if rid is None:
+                raise RuntimeError(f"[Label Injection] missing id_key='{id_key}' in a labeled row")
+            if rid not in labels_map:
+                missing_in_oracle.append(rid)
+                continue
+
+            if label_key in row:
+                if int(row[label_key]) != int(labels_map[rid]):
+                    mismatched.append((rid, row[label_key], labels_map[rid]))
+            else:
+                row[label_key] = labels_map[rid]
+
+        if missing_in_oracle:
+            raise RuntimeError(
+                f"[Label Injection] oracle missing {len(missing_in_oracle)} ids. "
+                f"example={missing_in_oracle[:5]}"
+            )
+        if mismatched:
+            raise RuntimeError(
+                f"[Label Injection] labeled vs oracle label mismatch {len(mismatched)} rows. "
+                f"example(id, labeled, oracle)={mismatched[:5]}"
+            )
+        out = task.run_round(round_index=r, split=split_r)
+
+        sampler = scheduler.get_sampler_for_round(round_idx=r, cfg=cfg_dict)
+
+        state, selected_ids = run_one_step(
             state=state,
+            adapter=adapter,
             sampler=sampler,
             budget=budget,
-            scores=out.pool_scores,  # ★不確実性スコアを渡す
+            scores=out.pool_scores if out.pool_scores else None,
+            features=out.pool_features,
+            feature_ids=out.pool_feature_ids,
             as_new_round=True,
         )
-
-        logger.info(
-            "  AL Step: selected=%d samples. Coverage: %.3f -> %.3f",
-            len(selected_ids),
-            state.coverage,
-            new_state.coverage,
-        )
-
-        # (c) 履歴保存
-        #     Task の metrics も一緒に al_history.csv に残す
-        _append_al_history(
-            layout, 
-            round_index=r, 
-            prev_state=state, 
-            new_state=new_state, 
-            metrics=out.metrics,
-        )
-        
-        # 選択されたIDの保存
-        if selected_ids:
-            sel_path = layout.path_selection_round_sample_ids(r)
-            sel_path.parent.mkdir(parents=True, exist_ok=True)
-            with sel_path.open("w", encoding="utf-8") as f:
-                for sid in selected_ids:
-                    f.write(f"{sid}\n")
-
-        # (d) ラウンド終了後の遅延クリーンアップ
-        cleanup_round_delayed(cfg, layout, round_index=r)
-        
-
-        # 次ラウンド用の状態更新
-        state = new_state
-        last_round_executed = r
-
-        # 停止条件: pool が空になったら終了
-        if stop_when_pool_empty and state.n_pool == 0:
-            logger.info(
-                "  Stop condition met: pool is empty (n_pool=0). "
-                "Terminating AL loop at round %d.",
-                r,
-            )
+        if not selected_ids and state.n_pool == 0:
+            LOGGER.info("AL Loop finished early (pool exhausted).")
             break
 
+        _save_selected_ids(layout, round_index=r, selected_ids=selected_ids)
+        
+        # 選択された行を保存する際も Universe から探す必要があるため _rows_by_ids の呼び出し元(split0)に注意
+        # ここでは split0.pool から探すので、初期Poolにあったデータなら見つかるはず
+        selected_rows = _rows_by_ids(split0.pool, id_key=id_key, ids=selected_ids)
+        _save_selected_rows(layout, round_index=r, selected_rows=selected_rows)
+        all_selected_rows.extend(selected_rows)
 
-    # 8) 最終ラウンドの preds_detail / gate_assign を final にコピー
-    if last_round_executed is not None:
-        last_round = last_round_executed
-        src_detail = layout.path_predictions_round_detail(last_round)
-        src_assign = layout.path_predictions_round_gate_assign(last_round)
+        _append_al_history(layout, state=state, added=len(selected_ids))
 
-        # preds_detail.csv
-        if src_detail.exists():
-            dst_detail = layout.path_predictions_final_detail()
-            dst_detail.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(src_detail, dst_detail)
-            logger.info("Copied final predictions to %s", dst_detail)
+        LOGGER.info(
+            "=== [Round %d] Done: added=%d n_labeled=%d n_pool=%d coverage=%.4f ===",
+            r,
+            len(selected_ids),
+            state.n_labeled,
+            state.n_pool,
+            state.coverage,
+        )
 
-        # gate_assign.csv (もしあれば)
-        if src_assign.exists():
-            dst_assign = layout.path_predictions_final_gate_assign()
-            src_assign.parent.mkdir(parents=True, exist_ok=True) # 元ファイルがない場合はコピーできないが、念のため
-            dst_assign.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(src_assign, dst_assign)
-            logger.info("Copied final gate assignments to %s", dst_assign)
+        # Round-end cleanup (ledger + config driven; immediate deletion; no delayed cleanup)
+        _ = clean_round_end(layout=layout, cfg=cfg_dict, round_index=r)
 
-    
-    # 9) 実験終了後のクリーンアップ
-    if last_round_executed is not None:
-        cleanup_round_delayed(cfg, layout, round_index=last_round_executed + 1)
-        cleanup_post_experiment(cfg, layout)
+    _save_selected_all(layout, selected_rows=all_selected_rows)
+    _finalize_experiment(layout, last_round=rounds-1)
 
-
-    logger.info("AL pipeline finished successfully.")
+    # Experiment-end cleanup (optional; config-driven)
+    _ = clean_experiment_end(layout=layout, cfg=cfg_dict)
     return 0
+
+
+def _rows_by_ids(rows: List[Mapping[str, Any]], *, id_key: str, ids: List[Any]) -> List[Dict[str, Any]]:
+    if not ids:
+        return []
+    wanted = set(ids)
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        if not isinstance(r, Mapping):
+            continue
+        if r.get(id_key) in wanted:
+            # 浅いコピーを返すことで、後続のラベル注入などが元データ(split0)を汚染しないようにする
+            out.append(dict(r))
+    return out
+
+
+def _split_from_state(base_split: Any, *, state: ALState, id_key: str) -> Any:
+    # 【修正】Universe対応: 初期データ(labeled)と追加データ(pool)の両方から探す
+    universe = base_split.labeled + base_split.pool
+    
+    labeled = _rows_by_ids(universe, id_key=id_key, ids=list(state.labeled_ids))
+    pool = _rows_by_ids(universe, id_key=id_key, ids=list(state.pool_ids))
+    
+    # Dev/Test は固定
+    dev = _rows_by_ids(base_split.dev, id_key=id_key, ids=list(state.dev_ids))
+    test = _rows_by_ids(base_split.test, id_key=id_key, ids=list(state.test_ids))
+    
+    from tensaku.data.base import DatasetSplit
+    return DatasetSplit(labeled=labeled, dev=dev, test=test, pool=pool)
+
+
+def _init_al_history(layout: ExperimentLayout, *, state: ALState) -> None:
+    f = layout.al_history
+    f.ensure_parent()
+    if not f.exists():
+        with f.open("w", encoding="utf-8") as w:
+            w.write("round,n_labeled,n_pool,added,coverage\n")
+    _append_al_history(layout, state=state, added=0)
+
+
+def _append_al_history(layout: ExperimentLayout, *, state: ALState, added: int) -> None:
+    f = layout.al_history
+    with f.open("a", encoding="utf-8") as w:
+        w.write(f"{state.round_index},{state.n_labeled},{state.n_pool},{added},{state.coverage:.6f}\n")
+
+
+def _save_selected_ids(layout: ExperimentLayout, *, round_index: int, selected_ids: List[Any]) -> None:
+    f = layout.selection_round_sample_ids(round=round_index)
+    f.ensure_parent()
+    with f.open("w", encoding="utf-8") as w:
+        for sid in selected_ids:
+            w.write(str(sid) + "\n")
+
+
+def _save_selected_rows(layout: ExperimentLayout, *, round_index: int, selected_rows: List[Dict[str, Any]]) -> None:
+    f = layout.selection_round_samples(round=round_index)
+    f.ensure_parent()
+    import pandas as pd
+    pd.DataFrame(selected_rows).to_csv(f.path, index=False)
+
+
+def _save_selected_all(layout: ExperimentLayout, *, selected_rows: List[Dict[str, Any]]) -> None:
+    f = layout.selection_all_samples
+    f.ensure_parent()
+    import pandas as pd
+    pd.DataFrame(selected_rows).to_csv(f.path, index=False)
+
+
+def _finalize_experiment(layout: ExperimentLayout, *, last_round: int) -> None:
+    # Copy last-round prediction artifacts to stable "final" locations (best-effort).
+    try:
+        src_pred = layout.predictions_round_detail(round=last_round)
+        dst_pred = layout.preds_detail_final
+        if src_pred.exists():
+            dst_pred.ensure_parent()
+            shutil.copy(src_pred.path, dst_pred.path)
+    except Exception:
+        pass
+
+    try:
+        src_gate = layout.predictions_round_gate_assign(round=last_round)
+        dst_gate = layout.gate_assign_final
+        if src_gate.exists():
+            dst_gate.ensure_parent()
+            shutil.copy(src_gate.path, dst_gate.path)
+    except Exception:
+        pass

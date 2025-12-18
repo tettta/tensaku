@@ -1,3 +1,15 @@
-conf_key: trust
+mode: compare
+  # conf_keys ではなく estimators (または targets) とし、詳細を記述可能にする
+estimators:
+  - name: msp
+    higher_is_better: true
+  
+  - name: entropy
+    higher_is_better: false
+    
+  - name: trust
+    higher_is_better: true
+
+# 共通の制約パラメータ
 eps_cse: 0.05
 cse_abs_err: 2

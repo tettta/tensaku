@@ -1,0 +1,11 @@
+# configs/dataset/base.yaml
+
+# 作成したクラスを指定
+_target_: tensaku.dataset.text_classification.LdccDataset
+
+# __init__ に渡す引数
+input_file: ${data.input_all}  # ← マスタデータを使って全クラスを網羅する
+label_key: ${data.label_key}
+text_key: ${data.text_key_primary}
+id_key: ${data.id_key}
+split: "all" # Probe用なのでallとする

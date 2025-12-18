@@ -2,3 +2,6 @@ name: "cl-tohoku/bert-base-japanese-v3"
 speed: full
 num_labels: 15
 ckpt: null
+
+freeze_base: false
+dropout: 0.1

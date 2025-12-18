@@ -1,3 +1,4 @@
+# /home/esakit25/work/tensaku/src/tensaku/trustscore.py
 # -*- coding: utf-8 -*-
 """
 @module     tensaku.trustscore
@@ -29,7 +30,7 @@
   - 1-shot:   TrustScorer(...).score(train_feats, train_labels, test_feats, test_pred, return_components=False)
   - 関数版:   trustscore(train_feats, train_labels, test_feats, test_pred, **kwargs)
 @notes
-  - registry 名は "trust"（gate/registry から `name: trust` で呼び出し可能）。
+  - registry 名は "trust_scorer"（Estimatorの "trust" と区別するため）。
   - `robust=True` を指定した場合、version="v2", k_list=[1,3,5], agg="median" を既定化（後方互換フラグ）。
 """
 
@@ -117,7 +118,7 @@ def _class_index_map(labels: np.ndarray) -> Dict[int, np.ndarray]:
 
 
 # ---- メイン実装 -----------------------------------------------------------------------------------
-@register("trust")
+@register("trust_scorer") # 【修正箇所】"trust" -> "trust_scorer" に変更して衝突回避
 class TrustScorer:
     """
     @role  Trust Score 推定器（v1/v2両対応）

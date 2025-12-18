@@ -1,3 +1,5 @@
 ckpt: null
 trust: false
 batch_size: 32
+
+device: "auto"
