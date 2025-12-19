@@ -1,21 +1,22 @@
 # configs/data/base.yaml
+
 qid: ${qid.value}
-
 data_root: data_sas
-split_dir: splits
+splits_dir: splits
 
-# base split（不変・qid固定）
-base_dir: ${run.data_dir}
+# 【修正】シードごとにフォルダを分けるロジック
+# run.project_root を起点にするため、どこから実行してもリンク切れしない
+base_dir: ${project_root}/${data.data_root}/${data.splits_dir}/${data.qid}/seed_${run.seed}
 
-# マスタデータ
-input_all: /home/esakit25/work/tensaku/data_sas/all.jsonl
+# 【修正】マスタデータもルート起点で指定
+input_all: ${project_root}/${data.data_root}/all.jsonl
 
+# 以下、変更なし
 files:
   labeled: labeled.jsonl
   dev: dev.jsonl
   test: test.jsonl
   pool: pool.jsonl
-
 text_key_primary: mecab
 label_key: score
 id_key: id

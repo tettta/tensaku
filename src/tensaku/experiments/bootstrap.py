@@ -271,6 +271,9 @@ def ensure_split_for_qid(
         else:
             # 重要：skip は「一致している時のみreuse」を強制（ここが場所食い違い防止の要）
             raise RuntimeError(msg + "\n(run.on_exist=skip disallows mismatch in Strict mode; set overwrite or fix config)")
+        
+    else:
+        log.info("[bootstrap] signature match -> skipping generation")
 
     if _pool_contains_label(data_dir / "pool.jsonl", expected["label_key"]):
         raise RuntimeError("pool.jsonl contains label_key (contract violation)")

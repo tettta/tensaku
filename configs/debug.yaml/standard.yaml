@@ -1,6 +1,6 @@
 # まずは安全側
 lr_full: 2.0e-5          # もし今もっと大きいなら、これが最重要
-epochs: 1
+epochs: 20
 batch_size: 16
 weight_decay: 0.01
 warmup_ratio: 0.06

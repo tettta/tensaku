@@ -60,31 +60,31 @@ def _normalize_labels(
     rows: List[Dict[str, Any]], label_key: str, split_name: str
 ) -> Tuple[List[Dict[str, Any]], Optional[int], Optional[int]]:
     clean: List[Dict[str, Any]] = []
-    bad = 0
     min_y: Optional[int] = None
     max_y: Optional[int] = None
 
-    for r in rows:
+    for i, r in enumerate(rows):
         v = r.get(label_key, None)
         try:
             y = int(v)
-        except Exception:
-            bad += 1
-            continue
+        except Exception as e:
+            # [Strict修正] 変換不可は即エラー (警告スキップ禁止)
+            raise ValueError(f"[{split_name}] Row {i}: label '{label_key}' is not int-castable: {v!r}") from e
+        
         if y < 0:
-            bad += 1
-            continue
+            # [Strict修正] 負ラベルは即エラー (警告スキップ禁止)
+            raise ValueError(f"[{split_name}] Row {i}: negative label found: {y}")
+
         r2 = dict(r)
         r2[label_key] = y
         clean.append(r2)
+        
         if min_y is None or y < min_y:
             min_y = y
         if max_y is None or y > max_y:
             max_y = y
 
-    if bad > 0:
-        LOGGER.warning("Skipped %d rows in %s due to invalid '%s'", bad, split_name, label_key)
-
+    # bad > 0 チェックは不要になったため削除 (ループ内でraiseするため)
     return clean, min_y, max_y
 
 
@@ -188,14 +188,6 @@ def train_core(
     return_model: bool = False,
     save_checkpoints: bool = True,
 ) -> Tuple[int, Optional[Any]]:
-    """
-    Strict Mode:
-      - cfg['run'/'data'/'model'/'train'] は必須
-      - cfg['data.text_key_primary'], cfg['data.label_key'], cfg['data.max_len'] は必須
-      - cfg['model.num_labels'], cfg['model.speed'] は必須
-      - cfg['train.lr_full or lr_frozen'], cfg['train.epochs'], cfg['train.batch_size'], cfg['train.patience'] は必須
-      - 安定化用に cfg['train.weight_decay'], cfg['train.warmup_ratio'], cfg['train.max_grad_norm'] も必須
-    """
     # ---- section presence ----
     if "run" not in cfg:
         raise KeyError("cfg missing 'run' section")
@@ -249,7 +241,9 @@ def train_core(
         LOGGER.error("Missing labeled data.")
         return 1, None
 
+    # [Strict修正] 不正データがあればここで落ちる
     rows_tr, min_tr, max_tr = _normalize_labels(rows_tr_raw, label_key, "train/labeled")
+    
     if rows_dv_raw:
         rows_dv, min_dv, max_dv = _normalize_labels(rows_dv_raw, label_key, "dev")
     else:
@@ -270,11 +264,7 @@ def train_core(
         return 1, None
 
     # ---- num_labels check ----
-    if min_tr is not None and min_tr < 0:
-        raise ValueError(f"Negative labels found in train: min={min_tr}")
-    if rows_dv and min_dv is not None and min_dv < 0:
-        raise ValueError(f"Negative labels found in dev: min={min_dv}")
-
+    # 負の値チェックは _normalize_labels で済んでいるが、最大値チェックはここで実施
     max_candidates = [v for v in (max_tr, max_dv) if v is not None]
     max_y = max(max_candidates) if max_candidates else 0
     n_class_data = int(max_y) + 1
@@ -291,18 +281,11 @@ def train_core(
     tok = create_tokenizer(cfg)
     model = create_model(cfg, n_class)
 
-    # Sanity: speed vs freeze_base mismatch (common cause of "not learning")
     base_trainable = any(p.requires_grad for n, p in model.named_parameters() if n.startswith("bert."))
     if speed == "full" and not base_trainable:
-        raise ValueError(
-            "speed=full but base model parameters are frozen. "
-            "Set cfg.model.freeze_base=false OR use speed=frozen."
-        )
+        raise ValueError("speed=full but base model parameters are frozen.")
     if speed == "frozen" and base_trainable:
-        raise ValueError(
-            "speed=frozen but base model parameters are trainable. "
-            "Set cfg.model.freeze_base=true OR use speed=full."
-        )
+        raise ValueError("speed=frozen but base model parameters are trainable.")
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
@@ -470,7 +453,6 @@ def train_core(
     LOGGER.info("Training finished. Best QWK=%.4f", best_qwk)
 
     if return_model:
-        # Prefer best checkpoint if exists; otherwise return current model.
         if hasattr(ckpt_dir, "best") and ckpt_dir.best.exists():
             try:
                 state = torch.load(ckpt_dir.best.path, map_location=device)
@@ -488,15 +470,8 @@ def train_core(
     return 0, None
 
 
-# =============================================================================
-# CLI (rarely used in this project; keep safe & explicit)
-# =============================================================================
-
 def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) -> int:
-    """
-    CLI wrapper (debug use).
-    Note: Pipeline/Task 経由の利用を推奨。単体CLI実行は ArtifactDir の構築が必要。
-    """
+    # CLI wrapper (Strict)
     if cfg is None:
         raise ValueError("tensaku.train.run requires cfg dict (Strict Mode)")
 
@@ -526,7 +501,6 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
     out_dir_str = run_cfg["out_dir"]
     out_dir = Path(out_dir_str)
 
-    # Try constructing ArtifactDir in a compatible way (explicit + noisy on failure).
     try:
         ckpt_dir = ArtifactDir(out_dir)  # type: ignore[misc]
     except TypeError:
@@ -543,5 +517,4 @@ def run(argv: Optional[List[str]] = None, cfg: Optional[Dict[str, Any]] = None) 
 
 
 if __name__ == "__main__":
-    # Strict Mode: configなし起動は想定しない
     pass

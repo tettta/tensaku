@@ -8,4 +8,4 @@ max_grad_norm: 1.0
 
 # early stop は一旦ゆるめるの推奨
 early_stopping: true
-patience: 8
+patience: 3

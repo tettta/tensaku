@@ -131,6 +131,12 @@ class UncertaintySampler(BaseSampler):
         features: Optional[np.ndarray] = None,
         feature_ids: Optional[Sequence[Any]] = None,
     ) -> List[Any]:
+        
+        if scores is None:
+            raise ValueError(
+                f"UncertaintySampler requires 'scores' but got None. "
+                "Check if Task returns pool_scores or if Scheduler is misconfigured (e.g. using Uncertainty for Round 0)."
+            )
         if budget <= 0 or state.n_pool <= 0:
             return []
 

@@ -1,14 +1,12 @@
 # configs/run/base.yaml
 seed: 42
-on_exist: skip   # ← 古い split を掴んで事故るのを避けるなら overwrite 推奨（運用で skip に戻すなら meta一致が前提）
+on_exist: skip   # /skip/overwrite/error
 save_logits: true
 save_predictions: true
 
-outputs_root: "outputs"
+project_root: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}
+outputs_root: ${run.project_root}/outputs
+out_dir: null
+data_dir: ${data.base_dir}
 
-# ★ split artifacts の canonical location はここ
-data_dir: ${hydra:runtime.cwd}/${data.data_root}/q-${data.qid}/base_split
-
-#（必要なら）実験出力先。Hydra の chdir 後を使うなら以下のどちらか
-out_dir: ${hydra:runtime.output_dir}   # 使える環境なら
-# out_dir: .                           # “cwd が実験ディレクトリ”運用なら
+tag: init${split.n_train}_b${al.budget}_ep${train.epochs}

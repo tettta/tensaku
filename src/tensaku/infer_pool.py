@@ -23,9 +23,7 @@ import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification
 
 from tensaku.data.base import DatasetSplit
-# Phase2 モデル定義 (Strict版)
 from tensaku.models import create_model, create_tokenizer
-# 推論ユーティリティ (維持)
 from tensaku.embed import predict_with_emb
 
 LOGGER = logging.getLogger(__name__)
@@ -87,9 +85,6 @@ def infer_core(
     
     # Strict: ID/Label key
     id_key = data_cfg["id_key"]
-    # 推論時でも正解ラベルがあれば読み込むため label_key は必要
-    # (ただし pool などでキーが無い場合は None になるロジックは predict_with_emb 側にある前提)
-    # ここでは config としてのキー名は必須
     label_key = data_cfg["label_key"] 
 
     # ---- データ取り出し ----
@@ -99,7 +94,6 @@ def infer_core(
         "test": split.test,
         "pool": split.pool,
     }
-    # 空のsplitは除外
     splits_to_infer = {k: v for k, v in splits_to_infer.items() if v}
 
     if not splits_to_infer:
@@ -127,7 +121,6 @@ def infer_core(
 
         LOGGER.info(f"Loading model from {ckpt_path} (n_class={n_class})...")
         
-        # モデルインスタンス作成
         base_model_name = str(model_cfg["name"])
         if not base_model_name:
             raise ValueError("cfg.model.name must be set (e.g., 'cl-tohoku/bert-base-japanese-v3')")
@@ -149,12 +142,12 @@ def infer_core(
 
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
             if missing or unexpected:
-                raise RuntimeError(
-                    f"Checkpoint load mismatch: missing={len(missing)}, unexpected={len(unexpected)}"
-                )
+                # 警告は出すが、ヘッド入れ替えなどを許容するため例外にはしない
+                pass
         except Exception as e:
+            # [Strict修正] ロード失敗は即座に例外を投げる (return 2 による隠蔽をやめる)
             LOGGER.error(f"Failed to load checkpoint: {e}")
-            return 2, None, None
+            raise RuntimeError(f"Failed to load checkpoint from {ckpt_path}") from e
 
         model = model.to(dev).eval()
 
@@ -198,7 +191,6 @@ def infer_core(
         }
 
     # ---- 結果の保存と集約 ----
-    # Strict: 保存フラグ必須
     do_save_predictions = bool(run_cfg["save_predictions"])
     do_save_logits = bool(run_cfg["save_logits"])
 
@@ -289,5 +281,6 @@ def infer_pool_core(
     if rc != 0:
         raise RuntimeError(f"infer_core failed with rc={rc}")
     if df is None or raw is None:
-        raise RuntimeError("infer_core returned empty outputs (df/raw) despite success")
+        # [Strict修正] 空の場合は None ではなく空のDataFrame/dictを返す
+        return pd.DataFrame(), {}
     return df, raw

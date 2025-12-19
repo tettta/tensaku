@@ -1,12 +1,11 @@
 # configs/config.yaml
 defaults:
   - _self_
-  - qid: Y14_1-2_1_3  # デフォルト QID を指定
   - al: base           # al/trust.yaml を使用
   - model: bert         # model/bert.yaml を使用
   - train: standard     # train/standard.yaml を使用
   - infer: base         # infer/base.yaml を使用
-  - data: base          # data/base.yaml を使用
+  - data: Y14_1-2_1_3          # data/base.yaml を使用
   - split: standard     # split/standard.yaml を使用
   - confidence: default # confidence/default.yaml を使用
   - gate: default       # gate/default.yaml を使用
@@ -14,17 +13,21 @@ defaults:
   - cleaner: base       # cleaner/base.yaml
   - task: sas           # task/sas.yaml を使用
 
+project_root: ${oc.env:TENSAKU_ROOT, ${hydra:runtime.cwd}}
+
 hydra:
   run:
     # 【変更】override_dirname を sampler の前に持ってくる
-    dir: ${run.outputs_root}/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
+    dir: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}/outputs/${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
 
   sweep:
-    dir: .
+    dir: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}/outputs
     
-    subdir: ${run.outputs_root}/${data.qid}/${hydra.job.override_dirname}/${al.sampler.name}/seed=${run.seed}
+    subdir: ${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
 
   job:
+    chdir: True
+
     config:
       override_dirname:
 
@@ -32,6 +35,8 @@ hydra:
         # 逆に言えば、ここに書いていないパラメータ（al.budgetなど）を変更するとフォルダ名になります。
         exclude_keys:
           # --- パスとして既に存在するもの ---
+          - run.project_root
+          - run.outputs_root
           - run.seed
           - data.qid
           - al.sampler.name
@@ -54,5 +59,26 @@ hydra:
           
           # --- 制御用変数 ---
           - run.on_exist
-          - run.out_dir
+          - run.outputs_dir
           - run.data_dir
+
+  job_logging:
+      version: 1
+      formatters:
+        simple:
+          format: "[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"
+
+      handlers:
+        console:
+          class: logging.StreamHandler
+          formatter: simple
+          stream: ext://sys.stdout
+        file:
+          class: logging.FileHandler
+          filename: main.log
+          formatter: simple
+
+      root:
+        level: INFO
+        handlers: [console, file]
+
