@@ -1,0 +1,170 @@
+python - <<'PY'
+import argparse
+from pathlib import Path
+import pandas as pd
+import numpy as np
+from datetime import datetime
+
+def _latest_csv(summary_dir: Path, qid: str, metric: str, x_col: str) -> Path:
+    # ファイル名例:
+    # compare_test_qwk__x-n_labeled__qid-Y14_1-2_1_3__tag-__init50...__aggseeds.csv
+    pat = f"compare_{metric}__x-{x_col}__qid-{qid}__*.csv"
+    cands = list(summary_dir.glob(pat))
+    if not cands:
+        raise FileNotFoundError(f"no compare csv found: {summary_dir}/{pat}")
+    return max(cands, key=lambda p: p.stat().st_mtime)
+
+def _higher_is_better(metric: str) -> bool:
+    m = metric.lower()
+    if "rmse" in m or "cse" in m:
+        return False
+    return True  # qwkなど
+
+def _require_cols(df: pd.DataFrame, cols: list[str], ctx: str):
+    missing = [c for c in cols if c not in df.columns]
+    if missing:
+        raise KeyError(f"[{ctx}] missing columns: {missing}. available={list(df.columns)}")
+
+def _points_table(df: pd.DataFrame, metric: str, x_col: str, points: list[int]) -> pd.DataFrame:
+    y_mean = f"{metric}__mean"
+    y_std  = f"{metric}__std"
+    y_cnt  = f"{metric}__count"
+    _require_cols(df, ["plot_label", x_col, y_mean, y_std, y_cnt], ctx=f"points:{metric}")
+
+    out_rows = []
+    for label, g in df.groupby("plot_label", dropna=False):
+        g = g.sort_values(x_col)
+        x_set = set(g[x_col].astype(int).tolist())
+        for x in points:
+            if x not in x_set:
+                out_rows.append({
+                    "plot_label": label, x_col: x,
+                    "mean": np.nan, "std": np.nan, "count": 0,
+                    "note": "missing_point"
+                })
+                continue
+            row = g[g[x_col].astype(int) == int(x)].iloc[0]
+            out_rows.append({
+                "plot_label": label,
+                x_col: int(x),
+                "mean": float(row[y_mean]) if pd.notna(row[y_mean]) else np.nan,
+                "std":  float(row[y_std])  if pd.notna(row[y_std])  else np.nan,
+                "count": int(row[y_cnt])   if pd.notna(row[y_cnt])  else 0,
+                "note": ""
+            })
+    return pd.DataFrame(out_rows)
+
+def _rank_points(df_points: pd.DataFrame, metric: str, x_col: str) -> pd.DataFrame:
+    hib = _higher_is_better(metric)
+    parts = []
+    for x, g in df_points.groupby(x_col, dropna=False):
+        gg = g.copy()
+        # 欠損は末尾へ
+        gg["_key"] = gg["mean"]
+        gg = gg.sort_values("_key", ascending=not hib, na_position="last").drop(columns=["_key"])
+        gg.insert(0, "rank", range(1, len(gg) + 1))
+        gg.insert(1, "metric", metric)
+        parts.append(gg)
+    return pd.concat(parts, ignore_index=True) if parts else df_points
+
+def _auc_table(df: pd.DataFrame, metric: str, x_col: str, x_max: int) -> pd.DataFrame:
+    y_mean = f"{metric}__mean"
+    y_std  = f"{metric}__std"
+    y_cnt  = f"{metric}__count"
+    _require_cols(df, ["plot_label", x_col, y_mean, y_std, y_cnt], ctx=f"auc:{metric}")
+
+    rows = []
+    for label, g in df.groupby("plot_label", dropna=False):
+        g = g.sort_values(x_col).copy()
+        g = g[g[x_col] <= x_max].copy()
+        g = g[pd.notna(g[y_mean])].copy()
+        if len(g) < 2:
+            rows.append({
+                "plot_label": label,
+                "metric": metric,
+                "x_max": x_max,
+                "x_min_used": int(g[x_col].min()) if len(g) else None,
+                "n_points_used": int(len(g)),
+                "auc": np.nan,
+                "avg_y_over_range": np.nan,
+                "note": "insufficient_points"
+            })
+            continue
+        x = g[x_col].astype(float).to_numpy()
+        y = g[y_mean].astype(float).to_numpy()
+
+        auc = float(np.trapz(y, x))
+        x_min = float(x.min())
+        x_rng = float(x.max() - x.min())
+        avg = float(auc / x_rng) if x_rng > 0 else np.nan
+
+        rows.append({
+            "plot_label": label,
+            "metric": metric,
+            "x_max": x_max,
+            "x_min_used": int(x_min),
+            "n_points_used": int(len(g)),
+            "auc": auc,
+            "avg_y_over_range": avg,
+            "note": ""
+        })
+    out = pd.DataFrame(rows)
+
+    hib = _higher_is_better(metric)
+    out = out.sort_values("avg_y_over_range", ascending=not hib, na_position="last").reset_index(drop=True)
+    out.insert(0, "rank", range(1, len(out) + 1))
+    return out
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--project-root", default=".", help="project root (contains outputs/)")
+    ap.add_argument("--qid", required=True)
+    ap.add_argument("--x-col", default="n_labeled")
+    ap.add_argument("--metrics", default="test_qwk,test_rmse,test_cse",
+                    help="comma-separated metrics (must match compare CSV naming)")
+    ap.add_argument("--points", default="100,200,400,800", help="comma-separated x points (int)")
+    ap.add_argument("--auc-max", default="400,800", help="comma-separated x_max for AUC windows")
+    args = ap.parse_args()
+
+    project_root = Path(args.project_root).resolve()
+    summary_dir = project_root / "outputs" / args.qid / "summary_plots"
+    if not summary_dir.is_dir():
+        raise FileNotFoundError(f"summary_plots not found: {summary_dir}")
+
+    metrics = [m.strip() for m in args.metrics.split(",") if m.strip()]
+    points = [int(x) for x in args.points.split(",") if x.strip()]
+    auc_max_list = [int(x) for x in args.auc_max.split(",") if x.strip()]
+
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    out_dir = summary_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    for metric in metrics:
+        csv_path = _latest_csv(out_dir, args.qid, metric, args.x_col)
+        df = pd.read_csv(csv_path)
+
+        # 1) 指定点ランキング
+        df_points = _points_table(df, metric=metric, x_col=args.x_col, points=points)
+        df_rank = _rank_points(df_points, metric=metric, x_col=args.x_col)
+
+        out_points = out_dir / f"rank_points__{metric}__x-{args.x_col}__qid-{args.qid}__{stamp}.csv"
+        out_rank   = out_dir / f"rank_points_ranked__{metric}__x-{args.x_col}__qid-{args.qid}__{stamp}.csv"
+        df_points.to_csv(out_points, index=False)
+        df_rank.to_csv(out_rank, index=False)
+
+        # 2) AUCランキング（<=400, <=800）
+        for x_max in auc_max_list:
+            df_auc = _auc_table(df, metric=metric, x_col=args.x_col, x_max=x_max)
+            out_auc = out_dir / f"rank_auc__{metric}__x-{args.x_col}__le{x_max}__qid-{args.qid}__{stamp}.csv"
+            df_auc.to_csv(out_auc, index=False)
+
+        print(f"[ok] metric={metric}")
+        print(f"  source: {csv_path}")
+        print(f"  wrote : {out_points.name}")
+        print(f"  wrote : {out_rank.name}")
+        for x_max in auc_max_list:
+            print(f"  wrote : rank_auc__{metric}__x-{args.x_col}__le{x_max}__qid-{args.qid}__{stamp}.csv")
+
+if __name__ == "__main__":
+    main()
+PY

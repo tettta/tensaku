@@ -1,0 +1,161 @@
+Metadata-Version: 2.4
+Name: tensaku
+Version: 0.0.1
+Summary: Tensaku: Japanese SAS with Confidence, HITL, and Active Learning
+Author: Tetta Esaki
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: transformers>=4.44
+Requires-Dist: torch
+Requires-Dist: scikit-learn
+Requires-Dist: pandas
+Requires-Dist: numpy
+Requires-Dist: matplotlib
+Requires-Dist: pyyaml
+Requires-Dist: seaborn>=0.13.2
+
+## run_all.sh 取扱説明書（README 用）
+
+### 目的
+
+`run_all.sh` は Tensaku の実験（qid × sampler × seed のグリッド）をまとめて回し、**各ジョブのログと結果サマリを自動で保存**するバッチ実行スクリプトです。Hydra の `preset` は使わず、**CLI で `run/train/al/cleaner` を直接指定**する運用を前提にしています。
+
+---
+
+## 前提
+
+* プロジェクトルート：`/home/esakit25/work/tensaku`
+* 実行：`python src/main.py ...` が動くこと
+* sampler の指定は **グループ選択**で行います
+
+  * ✅ `al/sampler=hybrid`（正しい）
+  * ❌ `al.sampler=hybrid`（`al.sampler` が文字列になり strict_cfg で落ちる）
+
+---
+
+## 基本の使い方
+
+### 1) 実行（フォアグラウンド）
+
+```bash
+cd /home/esakit25/work/tensaku
+chmod +x ./run_all.sh
+
+bash run_all.sh --mode prod
+```
+
+### 2) debug で軽く回す
+
+```bash
+bash run_all.sh --mode debug
+```
+
+### 3) qid / sampler / seed を絞る
+
+```bash
+bash run_all.sh --mode prod \
+  --qids Y14_1-2_1_3,Y14_1-2_2_1 \
+  --samplers hybrid,random \
+  --seeds 42,43
+```
+
+### 4) 追加のHydra override を渡す（スペース区切りで1つの文字列にまとめる）
+
+```bash
+bash run_all.sh --mode prod \
+  --extra "al.rounds=10 al.budget=50 run.on_exist=skip"
+```
+
+---
+
+## ログと成果物
+
+実行すると `logs/<mode>_batch_<timestamp>/` が作られ、以下が出ます。
+
+* `master.log`：バッチ全体の進捗ログ（開始/終了、各ジョブのコマンド等）
+* `summary.csv`：結果一覧（qid/sampler/seed/status/exit_code/log_path）
+* `run_<qid>_<sampler>_<seed>.log`：ジョブごとの stdout/stderr
+
+---
+
+## 既存出力がある場合の挙動（run.on_exist）
+
+`run.on_exist` で「既に出力があるジョブをどう扱うか」を制御します。
+
+* `skip`：既存があればスキップ（安全、デフォルト推奨）
+* `overwrite`：上書き実行
+* `error`：既存があればエラー終了
+
+例：
+
+```bash
+bash run_all.sh --mode prod --on-exist skip
+```
+
+---
+
+## nohup（バックグラウンド実行）
+
+### 推奨方針
+
+* `nohup` は **run_all の外側で使う**
+* run_all 自身は `--nohup-log` / `--pid-file` / `--print-log-dir` で運用を補助する
+
+### 例（stdout は run_all 側で確保するので外側は捨ててOK）
+
+```bash
+cd /home/esakit25/work/tensaku
+ts=$(date +%Y%m%d_%H%M%S)
+
+nohup bash -lc "cd /home/esakit25/work/tensaku && ./run_all.sh --mode prod \
+  --qids Y14_1-2_1_3 --seeds 42,43,44 \
+  --print-log-dir \
+  --nohup-log logs/nohup/run_all_${ts}.log \
+  --pid-file logs/nohup/run_all_${ts}.pid" \
+  > /dev/null 2>&1 &
+```
+
+### 進捗を見る
+
+```bash
+tail -f logs/nohup/run_all_*.log
+# または master.log を追う（print-log-dirでパスが出る）
+tail -f logs/prod_batch_YYYYmmdd_HHMMSS/master.log
+```
+
+### 停止する
+
+```bash
+kill "$(cat logs/nohup/run_all_*.pid)"
+```
+
+---
+
+## よくあるエラーと対処
+
+### `sampler must be Mapping, got str`
+
+原因：`al.sampler=hybrid` のように **ドットで指定**している（文字列代入）
+対処：**グループ指定**にする
+
+* ✅ `al/sampler=hybrid`
+* run_all では sampler を `al/sampler=<name>` で渡す
+
+---
+
+## 便利オプション（run_all 側）
+
+* `--dry-run`：コマンドだけ出して実行しない
+* `--stop-on-fail`：1ジョブでも失敗したらバッチを停止
+* `--hydra-full-error`：Hydra のフルスタックトレースを出す
+* `--nohup-log <path>`：run_all の stdout/stderr をファイルに tee
+* `--print-log-dir`：開始直後に LOG_DIR/Master/Summary のパスを出す
+* `--pid-file <path>`：PID をファイルに書く（kill しやすい）
+
+---
+
+## 推奨運用（デバッグ→本番）
+
+1. `--mode debug` で 1 qid / 1 sampler / 1 seed を短時間で確認
+2. 問題なければ `--mode prod` で qid/sampler/seed を広げる
+3. 長時間実行は `nohup`＋`--nohup-log`＋`--pid-file` を使う

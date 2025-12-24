@@ -3,13 +3,10 @@ mode: compare
 estimators:
   - name: msp
     higher_is_better: true
-  
-  - name: entropy
-    higher_is_better: false
     
   - name: trust
     higher_is_better: true
 
 # 共通の制約パラメータ
-eps_cse: 0.05
+eps_cse: [0.02, 0.05]
 cse_abs_err: 2

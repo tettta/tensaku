@@ -8,6 +8,7 @@
   - Sampler score key is decoupled from Gate score key(s).
   - Gate supports single metric or compare (multiple confidence keys) in one run_round.
   - No implicit fallback for required config keys (clear errors instead).
+  - Supports simple runtime post-registration via .register().
 
 Expected preds_detail columns (minimum):
   - id, split (one of labeled/dev/test/pool), y_true (optional for pool), y_pred
@@ -70,7 +71,6 @@ def _resolve_sampler_conf_key(cfg: Mapping[str, Any]) -> Optional[str]:
         return require_str(sampler_cfg, "by")
     raise ConfigError(
         f"al.sampler.name='{name}' requires a score key. Set al.sampler.conf_key (e.g. 'msp', 'trust', ...)."
-
         f"(This is intentionally decoupled from gate.conf_key/conf_keys.)"
     )
 
@@ -91,6 +91,7 @@ def _resolve_conf_meta(cfg: Mapping[str, Any]) -> Dict[str, bool]:
         hib = require_bool(item, "higher_is_better")
         meta[name] = hib
     return meta
+
 
 def _resolve_gate_targets(cfg: Mapping[str, Any]) -> Tuple[str, List[str]]:
     """
@@ -138,15 +139,47 @@ def _save_df_csv(layout: Any, file: Any, df: pd.DataFrame) -> None:
 
 
 class StandardSupervisedAlTask(BaseTask):
-    """Standard AL task (supervised) with per-round train/infer/conf/gate."""
+    """Standard AL task (supervised) with per-round train/infer/conf/gate.
+    
+    Adds simple in-memory registry for post-registration of hooks/callbacks.
+    """
 
     def __init__(self, cfg: Mapping[str, Any], adapter: Any, layout: Any):
         self.cfg = cfg
         self.adapter = adapter
         self.layout = layout
+        
+        # --- Simple Registration Logic (In-Memory) ---
+        self._registry: Dict[str, Any] = {}
+
+    def register(self, name: str, component: Any, overwrite: bool = False) -> None:
+        """
+        Dynamically register a component (e.g., a hook, callback, or extra logic).
+        This allows 'post-registration' after the task is created.
+        """
+        if name in self._registry and not overwrite:
+            raise ValueError(f"Component '{name}' is already registered. Use overwrite=True to replace.")
+        
+        self._registry[name] = component
+        logger.info(f"[Task] Registered component: '{name}' (type: {type(component).__name__})")
+
+    def get_component(self, name: str) -> Any:
+        if name not in self._registry:
+            raise KeyError(f"Component '{name}' not found in registry.")
+        return self._registry[name]
+
+    def _write_df(self, path: Any, df: pd.DataFrame) -> None:
+        _save_df_csv(self.layout, path, df)
 
     def run_round(self, round_index: int, split: Any) -> TaskOutputs:
         logger.info("[Task] run_round=%s", round_index)
+
+        # 0. Execute registered hooks (if any)
+        # 登録されたコンポーネントに 'on_round_start' メソッドがあればここで実行します
+        for name, comp in self._registry.items():
+            if hasattr(comp, "on_round_start") and callable(comp.on_round_start):
+                logger.info(f"[Task] Executing hook: {name}.on_round_start()")
+                comp.on_round_start(round_index=round_index, split=split)
 
         # 1) train
         self.step_train(round_index=round_index, split=split)
@@ -201,7 +234,7 @@ class StandardSupervisedAlTask(BaseTask):
         from tensaku.infer_pool import infer_pool_core  # local import
 
         ckpt_dir = self.layout.round_ckpt_dir(round=round_index)
-        infer_dir = self.layout.round_infer_dir(round=round_index).path
+        infer_dir = self.layout.round_infer_dir(round=round_index)
 
         # infer_core expects cfg['infer']['ckpt'] (Strict). Do not mutate shared cfg.
         infer_cfg = require_mapping(self.cfg, "infer")
@@ -210,49 +243,7 @@ class StandardSupervisedAlTask(BaseTask):
         cfg_round["infer"]["ckpt"] = str(ckpt_dir.best.path)
 
         df_detail, raw = infer_pool_core(split=split, out_dir=infer_dir, cfg=cfg_round)
-
-        try:
-            self._record_infer_artifacts(round_index=round_index, infer_dir=Path(infer_dir))
-        except Exception as e:
-            logger.warning("[Task] infer artifact recording skipped due to error: %s", e)
         return df_detail, raw
-
-    def _record_infer_artifacts(self, *, round_index: int, infer_dir: 'Path') -> None:
-        """Record infer artifacts into layout ledger (best-effort).
-
-        We explicitly set meta.lifetime='round' so cleanup can target only round-local artifacts.
-        """
-        infer_dir = Path(infer_dir)
-        if not infer_dir.exists():
-            return
-
-        # known outputs
-        candidates = list(infer_dir.glob("*.npy")) + list(infer_dir.glob("*.csv")) + list(infer_dir.glob("*.json"))
-        for p in candidates:
-            name = p.name
-            kind = None
-            if name.endswith("_logits.npy"):
-                kind = "logit"
-            elif name.endswith("_embs.npy"):
-                kind = "emb"
-            elif name == "preds_detail.csv":
-                kind = "pred"
-            elif name.endswith(".json"):
-                kind = "meta"
-            elif name.endswith(".csv"):
-                kind = "pred"
-            elif name.endswith(".npy"):
-                kind = "array"
-            else:
-                continue
-
-            self.layout.record_artifact(
-                p,
-                kind=kind,
-                round_index=round_index,
-                meta={"lifetime": "round", "source": "infer_pool"},
-            )
-
     def step_confidence(self, round_index: int, split: Any, df: pd.DataFrame, raw: Any) -> pd.DataFrame:
         # ここで単純に estimators を回すだけでなく、higher_is_better の定義チェックも兼ねる
         conf_cfg = require_mapping(self.cfg, "confidence")
@@ -277,104 +268,104 @@ class StandardSupervisedAlTask(BaseTask):
 
         return df2
 
+
     def step_hitl(self, round_index: int, split: Any, df: pd.DataFrame) -> TaskOutputs:
         gate_cfg = require_mapping(self.cfg, "gate")
-        
-        # 1. Confidence定義からメタ情報（higher_is_better）を取得
+
+        # 1) Confidence定義から {conf_key: higher_is_better} を取得
         conf_meta = _resolve_conf_meta(self.cfg)
-        
-        # 2. Gate設定からターゲット名を取得
+
+        # 2) Gate設定からターゲット名を取得
         mode, gate_keys = _resolve_gate_targets(self.cfg)
         sampler_key = _resolve_sampler_conf_key(self.cfg)
 
-        # 3. 必要なカラムの存在チェック
-        required_cols = {f"conf_{k}" for k in gate_keys}
+        # eps_cse can be float or list[float] (sweep)
+        eps_raw = gate_cfg.get("eps_cse", None)
+        if isinstance(eps_raw, (list, tuple)):
+            eps_list = [float(x) for x in eps_raw]
+            if len(eps_list) == 0:
+                raise ConfigError("gate.eps_cse list must be non-empty")
+        else:
+            eps_list = [float(eps_raw)]
+
+        # 3) 必要なカラムの存在チェック
+        required_cols = {"id", "split", "y_pred", "y_true"}  # y_true is required (pool may be NaN)
+        required_cols |= {f"conf_{k}" for k in gate_keys}
         if sampler_key is not None:
             required_cols.add(f"conf_{sampler_key}")
-        
-        missing = sorted([c for c in required_cols if c not in df.columns])
+
+        missing = [c for c in sorted(required_cols) if c not in df.columns]
         if missing:
-            raise ConfigError(f"Missing required confidence columns in preds_detail: {missing}")
+            raise ConfigError(f"preds_detail missing required columns: {missing}")
 
         metrics: Dict[str, Any] = {}
         gate_assign_rows: List[pd.DataFrame] = []
 
-        # 4. Gate 実行ループ
-        for i, conf_key in enumerate(gate_keys):
+        pool_ids = df.loc[df["split"] == "pool", "id"].to_list()
+
+        def _eps_tag(eps: float) -> str:
+            s = f"{eps:.6g}"
+            return s.replace(".", "p")
+
+        expanded_conf_keys: List[str] = []
+
+        # 4) Gate 実行ループ
+        first_written = False
+        for conf_key in gate_keys:
             if conf_key not in conf_meta:
-                 raise ConfigError(f"Gate target '{conf_key}' is not defined in confidence.estimators.")
-            
+                raise ConfigError(f"Gate target '{conf_key}' is not defined in confidence.estimators.")
+
             # Confidence側で定義された higher_is_better を使う
-            higher_is_better = conf_meta[conf_key]
-            
+            higher_is_better = bool(conf_meta[conf_key])
             col = f"conf_{conf_key}"
 
-            # GateConfig 用に辞書を構築
-            gate_cfg_i = dict(gate_cfg)
-            gate_cfg_i["higher_is_better"] = higher_is_better
-            
-            # Run HITL
-            hitl_out = run_hitl_from_detail_df(df=df, gate_cfg=gate_cfg_i, conf_column_name=col)
+            for eps in eps_list:
+                # keep gate_assign schema stable by encoding eps into conf_key
+                conf_key_tag = conf_key if len(eps_list) == 1 else f"{conf_key}@eps{_eps_tag(eps)}"
+                expanded_conf_keys.append(conf_key_tag)
 
-            # ... (metrics logging, assignment logic: same as before) ...
-            summary = hitl_out.to_summary_dict(prefix=f"gate.{conf_key}.")
-            metrics.update(summary)
+                # GateConfig 用に辞書を構築
+                gate_cfg_i = dict(gate_cfg)
+                gate_cfg_i["higher_is_better"] = higher_is_better
+                gate_cfg_i["eps_cse"] = float(eps)
 
-            if i == 0:
-                metrics.update(hitl_out.to_summary_dict(prefix="gate."))
+                # Run HITL
+                hitl_out = run_hitl_from_detail_df(df=df, gate_cfg=gate_cfg_i, conf_column_name=col)
 
-            assign = hitl_out.assign_df()
-            pool_ids = df.loc[df["split"] == "pool", "id"].to_list()
-            
-            if len(assign) != len(pool_ids):
-                raise RuntimeError(f"Gate assign length mismatch...")
-            
-            assign = assign.copy()
-            assign.insert(0, "id", pool_ids)
-            assign.insert(1, "split", "pool")
-            assign.insert(2, "conf_key", conf_key)
-            tau = getattr(hitl_out.dev, "tau", None) if hitl_out.dev is not None else None
-            assign.insert(3, "tau", tau)
-            
-            gate_assign_rows.append(
-    build_gate_assign_df(pool_ids=pool_ids, conf_key=conf_key, hitl_out=hitl_out)
-)
+                # metrics
+                metrics[f"gate.{conf_key_tag}.eps_cse"] = float(eps)
+                metrics.update(hitl_out.to_summary_dict(prefix=f"gate.{conf_key_tag}."))
 
-# 1. 中身がある行だけを集める
-        valid_rows = []
-        if gate_assign_rows:
-            valid_rows = [
-                r for r in gate_assign_rows
-                if (r is not None) and (not r.empty) and (not r.isna().all().all())
-            ]
+                # Backward compat: first result also under gate.*
+                if not first_written:
+                    metrics.update(hitl_out.to_summary_dict(prefix="gate."))
+                    first_written = True
 
-        # 2. 結合、なければ空スキーマ生成
-        if valid_rows:
-            gate_assign_df = pd.concat(valid_rows, ignore_index=True)
-        else:
-            # Taskはカラム名 "id", "tau" ... を知らなくて良い
-            gate_assign_df = create_empty_gate_assign_df()
+                # gate assignment (pool)
+                if pool_ids:
+                    gate_assign_rows.append(
+                        build_gate_assign_df(pool_ids=pool_ids, conf_key=conf_key_tag, hitl_out=hitl_out)
+                    )
+                else:
+                    gate_assign_rows.append(create_empty_gate_assign_df())
 
-        validate_gate_assign(gate_assign_df)
-        out_gate = self.layout.predictions_round_gate_assign(round=round_index)
-        _save_df_csv(self.layout, out_gate, gate_assign_df)
-
-        pool_scores: Dict[Any, float] = {}
-        if sampler_key is not None:
-            pool_scores = _extract_pool_scores(df, sampler_key)
-            metrics["sampler.conf_key"] = sampler_key
-        else:
-            metrics["sampler.conf_key"] = None
-
+        # gate meta
         metrics["gate.mode"] = mode
         metrics["gate.conf_keys"] = gate_keys
+        metrics["gate.conf_keys_expanded"] = expanded_conf_keys
+        metrics["gate.eps_cse"] = eps_list[0] if len(eps_list) == 1 else None
+        metrics["gate.eps_cse_list"] = eps_list if len(eps_list) > 1 else None
 
-        return TaskOutputs(metrics=metrics, pool_scores=pool_scores)
+        # write gate_assign
+        if gate_assign_rows:
+            gate_assign_df = pd.concat(gate_assign_rows, ignore_index=True)
+            validate_gate_assign(gate_assign_df)
+            self._write_df(path=self.layout.predictions_round_gate_assign(round=round_index), df=gate_assign_df)
 
-    # ----------------
-    # Internals
-    # ----------------
+        # sampler scores
+        pool_scores = _extract_pool_scores(df=df, conf_key=sampler_key) if sampler_key is not None else {}
 
+        return TaskOutputs(metrics=metrics, pool_scores=pool_scores, detail_df=df)
     def _apply_estimator(self, name: str, estimator: Any, df: pd.DataFrame, raw: Any) -> pd.DataFrame:
         """Apply an estimator and append one or more conf_* columns to df.
 

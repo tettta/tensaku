@@ -1,0 +1,53 @@
+outputs/Y14_1-2_2_4/init50_b50_ep20/hybrid/seed=42/main.log
+[2025-12-19 10:00:49,149][__main__][INFO] - --- [Phase 1] Bootstrapping Dataset Split ---
+[2025-12-19 10:00:49,152][__main__][INFO] - [bootstrap] signature match -> skipping generation
+[2025-12-19 10:00:49,155][__main__][ERROR] - Bootstrap failed. Fix the config or check data consistency.
+Traceback (most recent call last):
+  File "/home/esakit25/work/tensaku/src/main.py", line 100, in main
+    ensure_split_for_qid(cfg, logger=LOGGER)
+  File "/home/esakit25/work/tensaku/src/tensaku/experiments/bootstrap.py", line 307, in ensure_split_for_qid
+    raise ConfigError(
+tensaku.utils.strict_cfg.ConfigError: cfg.model.num_labels=15 does not match split label_stats.num_labels=11 (Strict: fix config or regenerate split)
+outputs/Y14_2-1_1_5/init50_b50_ep20/hybrid/seed=42/main.log
+[2025-12-19 10:00:59,316][__main__][INFO] - --- [Phase 1] Bootstrapping Dataset Split ---
+[2025-12-19 10:00:59,318][__main__][INFO] - [bootstrap] signature match -> skipping generation
+[2025-12-19 10:00:59,322][__main__][ERROR] - Bootstrap failed. Fix the config or check data consistency.
+Traceback (most recent call last):
+  File "/home/esakit25/work/tensaku/src/main.py", line 100, in main
+    ensure_split_for_qid(cfg, logger=LOGGER)
+  File "/home/esakit25/work/tensaku/src/tensaku/experiments/bootstrap.py", line 294, in ensure_split_for_qid
+    raise RuntimeError(
+RuntimeError: meta.json label_stats mismatch with split files (possible corruption). Set run.on_exist=overwrite to regenerate. meta={'label_min': 0, 'label_max': 14, 'num_labels': 15, 'unique_count': 15, 'unique_labels': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]} computed={'label_min': 0, 'label_max': 13, 'num_labels': 14, 'unique_count': 14, 'unique_labels': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]}
+outputs/Y14_2-1_2_3/init50_b50_ep20/hybrid/seed=42/main.log
+[2025-12-19 10:01:09,441][__main__][INFO] - --- [Phase 1] Bootstrapping Dataset Split ---
+[2025-12-19 10:01:09,443][__main__][INFO] - [bootstrap] signature match -> skipping generation
+[2025-12-19 10:01:09,447][__main__][ERROR] - Bootstrap failed. Fix the config or check data consistency.
+Traceback (most recent call last):
+  File "/home/esakit25/work/tensaku/src/main.py", line 100, in main
+    ensure_split_for_qid(cfg, logger=LOGGER)
+  File "/home/esakit25/work/tensaku/src/tensaku/experiments/bootstrap.py", line 307, in ensure_split_for_qid
+    raise ConfigError(
+tensaku.utils.strict_cfg.ConfigError: cfg.model.num_labels=15 does not match split label_stats.num_labels=13 (Strict: fix config or regenerate split)
+outputs/Y14_2-2_1_4/init50_b50_ep20/hybrid/seed=42/main.log
+[2025-12-19 10:01:20,907][__main__][INFO] - --- [Phase 1] Bootstrapping Dataset Split ---
+[2025-12-19 10:01:20,909][__main__][INFO] - [bootstrap] missing split files: ['labeled.jsonl', 'dev.jsonl', 'test.jsonl', 'pool.jsonl', 'meta.json']
+[2025-12-19 10:01:21,057][__main__][ERROR] - Bootstrap failed. Fix the config or check data consistency.
+Traceback (most recent call last):
+  File "/home/esakit25/work/tensaku/src/main.py", line 100, in main
+    ensure_split_for_qid(cfg, logger=LOGGER)
+  File "/home/esakit25/work/tensaku/src/tensaku/experiments/bootstrap.py", line 249, in ensure_split_for_qid
+    rc = split_run(argv=argv, cfg=dict(cfg))
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/esakit25/work/tensaku/src/tensaku/split.py", line 236, in run
+    raise ValueError(
+ValueError: [Y14_2-2_1_4] labels must be contiguous ints. got unique_labels=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14] (min=0, max=14)
+outputs/Y14_2-2_2_3/init50_b50_ep20/hybrid/seed=42/main.log
+[2025-12-19 10:01:31,528][__main__][INFO] - --- [Phase 1] Bootstrapping Dataset Split ---
+[2025-12-19 10:01:31,531][__main__][INFO] - [bootstrap] signature match -> skipping generation
+[2025-12-19 10:01:31,535][__main__][ERROR] - Bootstrap failed. Fix the config or check data consistency.
+Traceback (most recent call last):
+  File "/home/esakit25/work/tensaku/src/main.py", line 100, in main
+    ensure_split_for_qid(cfg, logger=LOGGER)
+  File "/home/esakit25/work/tensaku/src/tensaku/experiments/bootstrap.py", line 294, in ensure_split_for_qid
+    raise RuntimeError(
+RuntimeError: meta.json label_stats mismatch with split files (possible corruption). Set run.on_exist=overwrite to regenerate. meta={'label_min': 0, 'label_max': 14, 'num_labels': 15, 'unique_count': 15, 'unique_labels': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]} computed={'label_min': 0, 'label_max': 13, 'num_labels': 14, 'unique_count': 14, 'unique_labels': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]}

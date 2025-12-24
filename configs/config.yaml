@@ -5,23 +5,24 @@ defaults:
   - model: bert         # model/bert.yaml を使用
   - train: standard     # train/standard.yaml を使用
   - infer: base         # infer/base.yaml を使用
-  - data: Y14_1-2_1_3          # data/base.yaml を使用
+  - data: base          # data/base.yaml を使用
   - split: standard     # split/standard.yaml を使用
   - confidence: default # confidence/default.yaml を使用
   - gate: default       # gate/default.yaml を使用
   - run: base           # run/base.yaml を使用（中身はAL専用の共通設定）
   - cleaner: base       # cleaner/base.yaml
   - task: sas           # task/sas.yaml を使用
+  - viz: preset
 
-project_root: ${oc.env:TENSAKU_ROOT, ${hydra:runtime.cwd}}
+project_root: ${oc.env:TENSAKU_ROOT, .}}
 
 hydra:
   run:
     # 【変更】override_dirname を sampler の前に持ってくる
-    dir: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}/outputs/${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
+    dir: ${project_root}/outputs/${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
 
   sweep:
-    dir: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}/outputs
+    dir: ${project_root}/outputs
     
     subdir: ${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
 
@@ -31,19 +32,13 @@ hydra:
     config:
       override_dirname:
 
-        # 【重要】ここに書いたキーはフォルダ名（override）に含まれなくなります。
-        # 逆に言えば、ここに書いていないパラメータ（al.budgetなど）を変更するとフォルダ名になります。
         exclude_keys:
-          # --- パスとして既に存在するもの ---
           - run.project_root
           - run.outputs_root
           - run.seed
           - data.qid
           - al.sampler.name
-          - al/sampler # これを除外しないと、フォルダ名に "al.sampler=trust" が混ざってしまいます
-
-          # --- 設定グループ（Config Groups） ---
-          # これらを除外しないと "run=standard" 等がフォルダ名に付いて長くなりすぎます
+          - al/sampler
           - run
           - train
           - model

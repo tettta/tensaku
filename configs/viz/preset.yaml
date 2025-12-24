@@ -1,0 +1,6 @@
+  enabled: true
+  # x軸範囲（指定するなら）
+  x_min_round: null
+  x_max_round: null
+  x_min_n_labeled: null
+  x_max_n_labeled: null

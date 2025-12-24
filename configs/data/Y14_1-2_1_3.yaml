@@ -4,4 +4,4 @@ defaults:
   - _self_
 
 qid: Y14_1-2_1_3
-num_labels: 15
+# num_labels: 15

@@ -5,4 +5,4 @@ defaults:
 rounds: 1000
 budget: 50
 stop_when_pool_empty: true
-seed: {run.seed}
+seed: ${run.seed}

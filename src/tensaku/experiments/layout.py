@@ -19,6 +19,20 @@ from __future__ import annotations
 
 from tensaku.fs_core import ArtifactDir, ArtifactFile, Layout, define_file, define_family, define_dir_family
 
+
+class QidLayout(Layout):
+    """QID-level layout under outputs/{qid}.
+
+    This layout provides stable, cross-experiment aggregation paths.
+    In particular, it owns the per-qid experiment index.
+
+    Boundary:
+      - Knows: only QID root.
+      - Does NOT know: per-experiment folder structure details.
+    """
+
+    experiments_index = define_file("_index/experiments.jsonl", kind="index", record=False)
+
 class CheckpointDir(ArtifactDir):
     @property
     def best(self) -> ArtifactFile:

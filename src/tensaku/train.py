@@ -423,10 +423,12 @@ def train_core(
                 rmse,
             )
 
-            # save last
+            # save last (avoid duplicate ledger entries on overwrite)
             if save_checkpoints:
+                record_last = not ckpt_dir.last.exists()
                 ckpt_dir.last.save_checkpoint(
-                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class}
+                    {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
+                    record=record_last,
                 )
 
             # save best / early stop
@@ -434,8 +436,10 @@ def train_core(
                 best_qwk = qwk
                 no_improve_cnt = 0
                 if save_checkpoints:
+                    record_best = not ckpt_dir.best.exists()
                     ckpt_dir.best.save_checkpoint(
-                        {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class}
+                        {"model": model.state_dict(), "epoch": ep, "qwk": qwk, "n_class": n_class},
+                        record=record_best,
                     )
             else:
                 if patience > 0 and ep >= early_stop_min_epochs:
@@ -446,8 +450,10 @@ def train_core(
         else:
             LOGGER.info("Epoch %d/%d: TrainLoss=%.4f  (No dev data)", ep, epochs, train_loss_avg)
             if save_checkpoints:
+                record_best = not ckpt_dir.best.exists()
                 ckpt_dir.best.save_checkpoint(
-                    {"model": model.state_dict(), "epoch": ep, "n_class": n_class}
+                    {"model": model.state_dict(), "epoch": ep, "n_class": n_class},
+                    record=record_best,
                 )
 
     LOGGER.info("Training finished. Best QWK=%.4f", best_qwk)

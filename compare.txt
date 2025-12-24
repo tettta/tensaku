@@ -1,0 +1,29 @@
+python - <<'PY'
+import pandas as pd
+from pathlib import Path
+import matplotlib.pyplot as plt
+
+# 最新の compare CSV を拾う
+p = sorted(Path("outputs/Y14_1-2_1_3/summary_plots").glob("compare_test_qwk__x-n_labeled__*.csv"),
+           key=lambda x: x.stat().st_mtime, reverse=True)[0]
+df = pd.read_csv(p)
+
+df = df[df["n_labeled"] <= 800].copy()
+
+fig, ax = plt.subplots(figsize=(8,5))
+for label, g in df.groupby("plot_label"):
+    g = g.sort_values("n_labeled")
+    ax.plot(g["n_labeled"], g["test_qwk__mean"], marker="o", label=label)
+    # std帯も欲しければ↓（色は自動）
+    ax.fill_between(g["n_labeled"], g["test_qwk__mean"]-g["test_qwk__std"], g["test_qwk__mean"]+g["test_qwk__std"], alpha=0.15)
+
+ax.set_title("Learning Curve (zoom): test_qwk (n_labeled<=400)")
+ax.set_xlabel("Number of Labeled Samples")
+ax.set_ylabel("test_qwk")
+ax.legend(fontsize=9)
+fig.tight_layout()
+
+out = p.with_name(p.stem + "__zoom_le400.png")
+fig.savefig(out, dpi=160)
+print("[ok] saved:", out)
+PY

@@ -1,0 +1,8 @@
+transformers>=4.44
+torch
+scikit-learn
+pandas
+numpy
+matplotlib
+pyyaml
+seaborn>=0.13.2

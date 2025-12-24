@@ -300,14 +300,20 @@ def ensure_split_for_qid(
         raise RuntimeError("meta.json label_stats must be a mapping")
 
     # Optional: validate model.num_labels against computed stats.
+    # - If cfg.model.num_labels is None, treat as "not specified" and skip validation.
+    #   (Recommended: set null and rely on split meta.json label_stats.num_labels.)
     model_cfg = cfg.get("model")
     if isinstance(model_cfg, Mapping) and ("num_labels" in model_cfg):
-        cfg_num_labels = require_int(model_cfg, ("num_labels",), ctx="cfg.model")
-        if cfg_num_labels != int(computed_stats["num_labels"]):
-            raise ConfigError(
-                f"cfg.model.num_labels={cfg_num_labels} does not match split label_stats.num_labels={computed_stats['num_labels']} "
-                "(Strict: fix config or regenerate split)"
-            )
+        v = model_cfg.get("num_labels")
+        if v is None:
+            log.info("[bootstrap] cfg.model.num_labels is None -> skip validation (use split label_stats)")
+        else:
+            cfg_num_labels = require_int(model_cfg, ("num_labels",), ctx="cfg.model")
+            if cfg_num_labels != int(computed_stats["num_labels"]):
+                raise ConfigError(
+                    f"cfg.model.num_labels={cfg_num_labels} does not match split label_stats.num_labels={computed_stats['num_labels']} "
+                    "(Strict: fix config or regenerate split)"
+                )
 
     log.info("[bootstrap] split ok: %s", data_dir)
     return data_dir

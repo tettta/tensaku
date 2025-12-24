@@ -2,10 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 @module   : tensaku.infer_pool
-@role     : 推論実行 (Strict Mode)
+@role     : 推論実行 (Strict Mode; fs_core/ledger integrated)
 @overview :
-    - infer_core: Configに従い、指定されたチェックポイントをロードして推論を行う。
-                  デフォルト値を廃止し、CKPT不在時は即時エラーとする。
+  - infer_core:
+      * Config に従い推論を行い、preds_detail.csv と *.npy を保存する。
+      * out_dir は Layout から取得した ArtifactDir を要求し、保存は fs_core 経由で台帳へ記録する。
+      * デフォルト/フォールバックは置かず、必要キーが無ければ ConfigError を投げる。
+  - infer_pool_core:
+      * Task/Pipeline 用の薄いラッパ（df_detail, raw を返す）
 """
 
 from __future__ import annotations
@@ -15,22 +19,21 @@ import logging
 import os
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Mapping
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoConfig, AutoModelForSequenceClassification
 
 from tensaku.data.base import DatasetSplit
-from tensaku.models import create_model, create_tokenizer
 from tensaku.embed import predict_with_emb
+from tensaku.fs_core import ArtifactDir
+from tensaku.utils.strict_cfg import ConfigError, require_int, require_mapping, require_str
 
 LOGGER = logging.getLogger(__name__)
 
 
 def _read_jsonl(path: str) -> List[dict]:
-    # (変更なし)
     rows: List[dict] = []
     if not os.path.exists(path):
         return rows
@@ -39,98 +42,116 @@ def _read_jsonl(path: str) -> List[dict]:
             line = line.strip()
             if not line:
                 continue
-            try:
-                rows.append(json.loads(line))
-            except Exception:
-                continue
+            rows.append(json.loads(line))
     return rows
 
 
 def _select_device(device_name: str) -> torch.device:
-    """Strict: autoを許容しつつも、Configからの入力を必須とする"""
-    if device_name == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(device_name)
+    device_name = (device_name or "").strip().lower()
+    if device_name == "cpu":
+        return torch.device("cpu")
+    if device_name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("cfg.infer.device=cuda but CUDA is not available")
+        return torch.device("cuda")
+    if device_name.startswith("cuda:"):
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"cfg.infer.device={device_name} but CUDA is not available")
+        return torch.device(device_name)
+    raise ValueError(f"Unsupported device: {device_name} (expected: cpu/cuda/cuda:0...)")
 
 
-# =============================================================================
-# infer_core (Strict Mode)
-# =============================================================================
+def _require_artifact_dir(out_dir: Any) -> ArtifactDir:
+    if not isinstance(out_dir, ArtifactDir):
+        raise TypeError(
+            "infer_core requires out_dir to be an ArtifactDir bound to Layout context. "
+            "Pass e.g. layout.round_infer_dir(round=...) instead of a plain Path."
+        )
+    if getattr(out_dir, "_context", None) is None:
+        raise TypeError(
+            "infer_core requires out_dir to be an ArtifactDir bound to Layout context (detached). "
+            "Make sure you obtained it from Layout, not by constructing ArtifactDir manually."
+        )
+    return out_dir
+
+
+def _infer_round_index_from_dir(out_dir: ArtifactDir) -> Optional[int]:
+    params = getattr(out_dir, "params", {}) or {}
+    for key in ("round", "round_index"):
+        if key in params:
+            try:
+                return int(params[key])
+            except Exception:
+                pass
+    return None
+
 
 def infer_core(
     split: DatasetSplit,
-    out_dir: Path,
+    out_dir: ArtifactDir,
     cfg: Mapping[str, Any],
-    model: Optional[Any] = None, # タスクから渡される場合はメモリ上のモデルを使う
+    model: Optional[Any] = None,  # Task から渡される場合は in-memory model を使う
     return_df: bool = False,
     return_raw_outputs: bool = False,
 ) -> Tuple[int, Optional[pd.DataFrame], Optional[Dict[str, Any]]]:
     """
     Strict Mode:
-      - 必須キー: run.save_predictions, run.save_logits, infer.ckpt, infer.device, infer.batch_size
-      - ckptパスが存在しない場合は FileNotFoundError
+      - 必須キー（最小）:
+          data.id_key, data.label_key, data.text_key_primary, data.max_len
+          model.name, model.num_labels
+          infer.device, infer.batch_size
+          infer.ckpt (model が None の場合のみ)
+      - out_dir は ArtifactDir（Layout 由来）必須
+      - すべての保存は fs_core を通し、台帳へ記録する（pred/logit/emb/meta）
     """
-    # 必須セクション確認
-    if "run" not in cfg: raise KeyError("cfg missing 'run' section")
-    if "data" not in cfg: raise KeyError("cfg missing 'data' section")
-    if "model" not in cfg: raise KeyError("cfg missing 'model' section")
-    if "infer" not in cfg: raise KeyError("cfg missing 'infer' section")
+    out_dir = _require_artifact_dir(out_dir)
+    out_dir.ensure()
+    round_index = _infer_round_index_from_dir(out_dir)
 
-    run_cfg = cfg["run"]
-    data_cfg = cfg["data"]
-    model_cfg = cfg["model"]
-    infer_cfg = cfg["infer"]
+    data_cfg = require_mapping(cfg, "data")
+    model_cfg = require_mapping(cfg, "model")
+    infer_cfg = require_mapping(cfg, "infer")
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Strict: ID/Label key
-    id_key = data_cfg["id_key"]
-    label_key = data_cfg["label_key"] 
+    # data keys
+    id_key = require_str(data_cfg, "id_key")
+    label_key = require_str(data_cfg, "label_key")
+    text_key_primary = require_str(data_cfg, "text_key_primary")
+    max_len = require_int(data_cfg, "max_len")
 
-    # ---- データ取り出し ----
-    splits_to_infer = {
+    # infer keys
+    device_name = require_str(infer_cfg, "device")
+    batch_size = require_int(infer_cfg, "batch_size")
+
+    # model keys
+    n_class = require_int(model_cfg, "num_labels")
+    base_model_name = require_str(model_cfg, "name")
+
+    # ---- 推論対象 ----
+    splits_to_infer: Dict[str, List[dict]] = {
         "labeled": split.labeled,
         "dev": split.dev,
         "test": split.test,
         "pool": split.pool,
     }
     splits_to_infer = {k: v for k, v in splits_to_infer.items() if v}
-
     if not splits_to_infer:
         LOGGER.warning("All target splits are empty.")
-        return 0, None, None
+        return 0, (pd.DataFrame() if return_df else None), ({} if return_raw_outputs else None)
 
     # ---- モデル準備 ----
-    # Strict: device 必須
-    device_name = infer_cfg["device"]
     dev = _select_device(device_name)
-    
-    # Strict: num_labels 必須 (ckptからの推測ロジック廃止)
-    n_class = int(model_cfg["num_labels"])
 
-    # モデル構築
     if model is None:
-        # Strict: ckpt パス必須
-        ckpt_path_str = infer_cfg["ckpt"]
-        if not ckpt_path_str:
-            raise ValueError("infer.ckpt must be specified in config (Strict Mode)")
-        
+        ckpt_path_str = require_str(infer_cfg, "ckpt")
         ckpt_path = Path(ckpt_path_str)
         if not ckpt_path.exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
         LOGGER.info(f"Loading model from {ckpt_path} (n_class={n_class})...")
-        
-        base_model_name = str(model_cfg["name"])
-        if not base_model_name:
-            raise ValueError("cfg.model.name must be set (e.g., 'cl-tohoku/bert-base-japanese-v3')")
 
         hf_cfg = AutoConfig.from_pretrained(base_model_name, num_labels=n_class)
-        model = AutoModelForSequenceClassification.from_config(hf_cfg)
+        model0 = AutoModelForSequenceClassification.from_config(hf_cfg)
 
-        tokenizer = create_tokenizer(cfg)
-
-        # 重みロード
         try:
             bundle = torch.load(ckpt_path, map_location="cpu")
             state_dict = bundle
@@ -139,26 +160,21 @@ def infer_core(
                     state_dict = bundle["model"]
                 elif "state_dict" in bundle:
                     state_dict = bundle["state_dict"]
-
-            missing, unexpected = model.load_state_dict(state_dict, strict=False)
-            if missing or unexpected:
-                # 警告は出すが、ヘッド入れ替えなどを許容するため例外にはしない
-                pass
+            if not isinstance(state_dict, dict):
+                raise TypeError(f"Unsupported checkpoint format: {type(bundle)}")
+            model0.load_state_dict(state_dict, strict=False)
         except Exception as e:
-            # [Strict修正] ロード失敗は即座に例外を投げる (return 2 による隠蔽をやめる)
-            LOGGER.error(f"Failed to load checkpoint: {e}")
+            LOGGER.exception(f"Failed to load checkpoint: {e}")
             raise RuntimeError(f"Failed to load checkpoint from {ckpt_path}") from e
 
-        model = model.to(dev).eval()
-
+        model = model0.to(dev).eval()
+        from tensaku.models import create_tokenizer  # local import to keep module light at import time
+        tokenizer = create_tokenizer(cfg)
     else:
         LOGGER.info("Using in-memory model passed from Task.")
+        from tensaku.models import create_tokenizer  # local import
         tokenizer = create_tokenizer(cfg)
         model = model.to(dev).eval()
-
-    # Strict: max_len, batch_size 必須
-    max_len = int(data_cfg["max_len"])
-    batch_size = int(infer_cfg["batch_size"])
 
     # ---- 推論ループ ----
     outputs: Dict[str, Dict[str, Any]] = {}
@@ -166,109 +182,108 @@ def infer_core(
     for split_name, rows in splits_to_infer.items():
         LOGGER.info(f"Inferring split: {split_name} (n={len(rows)})")
 
-        text_key = data_cfg["text_key_primary"]
-        
-        # predict_with_emb は既存実装を利用
         logits, labels, embs = predict_with_emb(
             model,
             rows,
             tokenizer=tokenizer,
             bs=batch_size,
             max_len=max_len,
-            device=dev.type,
-            label_key=label_key,       # <--- Added
-            text_key_primary=text_key  # <--- Added
+            device=dev.type,              # existing implementation expects str
+            label_key=label_key,
+            text_key_primary=text_key_primary,
         )
-        
+
         y_pred = logits.argmax(axis=-1)
-        
+
         outputs[split_name] = {
+            "rows": rows,
             "logits": logits,
+            "labels": labels,
             "embs": embs,
-            "labels": labels, 
-            "y_pred": y_pred, 
-            "rows": rows
+            "y_pred": y_pred,
         }
 
-    # ---- 結果の保存と集約 ----
-    do_save_predictions = bool(run_cfg["save_predictions"])
-    do_save_logits = bool(run_cfg["save_logits"])
+        # ---- fs_core 保存（台帳に記録）----
+        if round_index is None:
+            raise ConfigError(
+                "[infer] out_dir does not contain round index in params; "
+                "kind=logit/emb requires round_index. Use layout.round_infer_dir(round=...)."
+            )
 
-    # 1. npy 書き出し
-    if do_save_logits:
-        for split_name, data in outputs.items():
-            if data.get("logits") is not None:
-                np.save(out_dir / f"{split_name}_logits.npy", data["logits"])
-            if data.get("embs") is not None:
-                np.save(out_dir / f"{split_name}_embs.npy", data["embs"])
+        (out_dir / f"{split_name}_logits.npy").save_npy(
+            logits, record=True, kind="logit", round_index=round_index, meta={"split": split_name}
+        )
+        (out_dir / f"{split_name}_embs.npy").save_npy(
+            embs, record=True, kind="emb", round_index=round_index, meta={"split": split_name}
+        )
 
-    # 2. DataFrame 構築
-    dfs = []
-    raw_outputs = {}
+    # ---- DataFrame 構築 ----
+    dfs: List[pd.DataFrame] = []
+    raw_outputs: Dict[str, Any] = {}
 
     for split_name, data in outputs.items():
         rows = data["rows"]
-        
-        # 基本列のみを持つ DataFrame
-        df_split = pd.DataFrame({
-            "id": [r.get(id_key, str(i)) for i, r in enumerate(rows)],
-            "split": split_name,
-            "y_pred": data["y_pred"],
-        })
 
-        # 正解ラベル (あれば)
+        ids_list = [r.get(id_key, str(i)) for i, r in enumerate(rows)]
+
+        df_split = pd.DataFrame(
+            {
+                "id": [r.get(id_key, str(i)) for i, r in enumerate(rows)],
+                "split": split_name,
+                "y_pred": data["y_pred"],
+            }
+        )
+
         if data.get("labels") is not None:
             df_split["y_true"] = data["labels"]
-        else:
-            df_split["y_true"] = np.nan
 
         dfs.append(df_split)
-        
-        # Raw Outputs (Confidence計算用)
-        raw_outputs[split_name] = {
-            "logits": data["logits"],
-            "embs": data["embs"],
-            "labels": data["labels"],
-            "y_pred": data["y_pred"],
-            "ids": df_split["id"].tolist()
-        }
 
-    final_df = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        if return_raw_outputs:
+            raw_outputs[split_name] = {
+                "ids": ids_list,
+                "logits": data.get("logits"),
+                "embs": data.get("embs"),
+                "labels": data.get("labels"),
+                "y_pred": data.get("y_pred"),
+            }
 
-    # 3. CSV 書き出し (Base)
-    if do_save_predictions and not final_df.empty:
-        save_path = out_dir / "preds_detail.csv"
-        final_df.to_csv(save_path, index=False)
-        LOGGER.info(f"Saved base predictions to {save_path}")
+    final_df = pd.concat(dfs, axis=0, ignore_index=True) if dfs else pd.DataFrame()
 
-    # meta 書き出し
+    # ---- preds_detail.csv（台帳に記録）----
+    preds_file = out_dir / "preds_detail.csv"
+    preds_file.save_csv(
+        final_df.itertuples(index=False, name=None),
+        header=list(final_df.columns),
+        record=True,
+        kind="pred",
+        round_index=round_index,
+        meta={"name": "preds_detail"},
+    )
+    LOGGER.info(f"Saved predictions to {preds_file.path}")
+
+    # ---- infer.meta.json（台帳に記録）----
     meta = {
         "generated_at": time.strftime("%F %T"),
-        "ckpt": str(infer_cfg.get("ckpt", "in-memory")),
+        "ckpt": str(require_str(infer_cfg, "ckpt")) if model is None else "in-memory",
+        "n_class": n_class,
+        "splits": {k: len(v) for k, v in splits_to_infer.items()},
     }
-    with open(out_dir / "infer.meta.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
+    (out_dir / "infer.meta.json").save_json(meta, record=True, kind="meta", round_index=round_index)
 
-    return 0, final_df if return_df else None, raw_outputs if return_raw_outputs else None
+    return 0, (final_df if return_df else None), (raw_outputs if return_raw_outputs else None)
 
-# =============================================================================
-# Compatibility wrapper (Task/Pipeline convenience)
-# =============================================================================
 
 def infer_pool_core(
     *,
-    split: Any,
-    out_dir: Any,
+    split: DatasetSplit,
+    out_dir: ArtifactDir,
     cfg: Mapping[str, Any],
     model: Optional[Any] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
-    """Compatibility wrapper.
-
-    Returns:
-      df_detail, raw_outputs
-
-    Raises:
-      RuntimeError if infer_core fails.
+    """
+    Task 側から呼ぶための薄いラッパ。
+    - out_dir は layout.round_infer_dir(round=...) の ArtifactDir を渡すこと。
     """
     rc, df, raw = infer_core(
         split=split,
@@ -280,7 +295,4 @@ def infer_pool_core(
     )
     if rc != 0:
         raise RuntimeError(f"infer_core failed with rc={rc}")
-    if df is None or raw is None:
-        # [Strict修正] 空の場合は None ではなく空のDataFrame/dictを返す
-        return pd.DataFrame(), {}
-    return df, raw
+    return (df if df is not None else pd.DataFrame()), (raw if raw is not None else {})

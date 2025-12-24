@@ -227,21 +227,16 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
             raise KeyError(f"label_key '{label_key}' is missing in a record (qid={qid})")
         labels.append(_coerce_int_label_strict(r[label_key], label_key=label_key, qid=qid))
 
-    # label stats (Strict): classification labels must be contiguous.
+    # label stats (Strict): allow missing labels (gaps), but enforce integer labels and min==0.
+    # Many QIDs naturally lack some score values; we still size the classifier as (max+1).
     label_min = min(labels)
     label_max = max(labels)
     unique_labels = sorted(set(labels))
-    expected = list(range(label_min, label_max + 1))
-    if unique_labels != expected:
-        raise ValueError(
-            f"[{qid}] labels must be contiguous ints. "
-            f"got unique_labels={unique_labels} (min={label_min}, max={label_max})"
-        )
     if label_min != 0:
         raise ValueError(
             f"[{qid}] labels must start at 0 (Strict). got min={label_min}, max={label_max}"
         )
-    num_labels = label_max + 1
+    num_labels = int(label_max) + 1
 
     n_total = len(rows)
 

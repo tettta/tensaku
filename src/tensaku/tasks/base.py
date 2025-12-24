@@ -2,11 +2,15 @@
 # -*- coding: utf-8 -*-
 """tensaku.tasks.base
 
-Base task interface and factory.
+Base task interface.
 
 Design principles (MUST)
 - No fallback: unknown task name is an error.
 - Tasks are orchestrators: they may call lower-level modules, but pipelines must not depend on task internals.
+
+NOTE:
+- Task factory has been moved to `tensaku.tasks.factory`.
+- `create_task` remains here only as a *compat wrapper* (imports at call-time to avoid circular imports).
 """
 
 from __future__ import annotations
@@ -17,24 +21,17 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from tensaku.experiments.layout import ExperimentLayout
 from tensaku.data.base import BaseDatasetAdapter, DatasetSplit
-from tensaku.utils.strict_cfg import ConfigError, require_mapping, require_str
 
 LOGGER = logging.getLogger(__name__)
 
 
 @dataclass
 class TaskOutputs:
-    """Return type for Task.run_round.
-
-    pool_scores:
-        Mapping from score-key to {id -> score} mapping. (Implementation chooses actual representation;
-        pipeline will consume per sampler requirements.)
-    """
     metrics: Dict[str, Any] = field(default_factory=dict)
     pool_scores: Dict[Any, float] = field(default_factory=dict)
     pool_features: Optional[Any] = None
     pool_feature_ids: Optional[List[Any]] = None
-
+    detail_df: Optional[Any] = None
 
 class BaseTask:
     """Base class for all tasks."""
@@ -50,21 +47,8 @@ class BaseTask:
         raise NotImplementedError
 
 
-
 def create_task(cfg: Mapping[str, Any], adapter: BaseDatasetAdapter, layout: ExperimentLayout) -> BaseTask:
-    """Factory for tasks (STRICT)."""
-    task_cfg = require_mapping(cfg, ("task",), ctx="cfg")
-    name = require_str(task_cfg, ("name",), ctx="cfg.task").lower()
+    """Compatibility wrapper. Prefer `tensaku.tasks.factory.create_task`."""
+    from tensaku.tasks.factory import create_task as _create_task
 
-    if name == "sas_total_score":
-        from tensaku.tasks.sas_total_score import SasTotalScoreTask
-        # ★ keyword-only 対応
-        return SasTotalScoreTask(cfg=cfg, adapter=adapter, layout=layout)
-
-    if name == "standard":
-        from tensaku.tasks.standard import StandardSupervisedAlTask
-        # ★ keyword-only 対応
-        return StandardSupervisedAlTask(cfg=cfg, adapter=adapter, layout=layout)
-
-    raise ConfigError(f"Unknown task name: '{name}'. (no fallback allowed)")
-
+    return _create_task(cfg=cfg, adapter=adapter, layout=layout)
