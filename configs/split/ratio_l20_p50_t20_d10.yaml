@@ -1,0 +1,15 @@
+name: ratio_l20_p50_t20_d10
+# ratio mode (labeled/pool/test/dev)
+ratio:
+  labeled: 0.2
+  pool: 0.5
+  test: 0.2
+  dev: 0.1
+
+# n_train must be null/omitted in ratio mode
+n_train: null
+
+stratify: true
+id_key: id
+text_key: mecab
+label_key: score

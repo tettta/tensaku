@@ -197,7 +197,12 @@ def export_tau_sweep(
 ) -> List[Path]:
     if not preds_detail_csv.exists():
         raise FileNotFoundError(f"preds_detail_csv not found: {preds_detail_csv}")
+    # Split outputs to keep directory readable.
     out_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir = out_dir / "tables"
+    meta_dir = out_dir / "meta"
+    tables_dir.mkdir(parents=True, exist_ok=True)
+    meta_dir.mkdir(parents=True, exist_ok=True)
 
     df = pd.read_csv(preds_detail_csv)
     required_cols = {"y_true", "y_pred"}
@@ -252,11 +257,11 @@ def export_tau_sweep(
                 selected_k=selected.selected_k,
             )
 
-            out_csv = out_dir / f"tau_sweep_{split_name}_{ck}.csv"
+            out_csv = tables_dir / f"tau_sweep_{split_name}_{ck}.csv"
             curve.to_csv(out_csv, index=False, encoding="utf-8")
             paths.append(out_csv)
 
-            out_json = out_dir / f"tau_selected_{split_name}_{ck}.json"
+            out_json = meta_dir / f"tau_selected_{split_name}_{ck}.json"
             out_json.write_text(json.dumps(asdict(selected), ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             paths.append(out_json)
 

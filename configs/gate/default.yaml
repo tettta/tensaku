@@ -7,6 +7,10 @@ estimators:
   - name: trust
     higher_is_better: true
 
+# Primary confidence estimator for *operational* gating in recipe=al_hitl.
+# This should match one of confidence.estimators[*].name.
+primary: msp
+
 # 共通の制約パラメータ
 eps_cse: [0.02, 0.05]
 cse_abs_err: 2

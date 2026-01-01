@@ -1,0 +1,21 @@
+# @package split
+# configs/split/mode/ratio.yaml
+
+
+mode: ratio
+
+ratio:
+  labeled: 0.2
+  pool: 0.5
+  dev: 0.1
+  test: 0.2
+
+# for naming
+ratio_pct:
+  labeled: 20
+  pool: 50
+  dev: 10
+  test: 20
+
+subdir: sp-r_lab${split.ratio_pct.labeled}p_pool${split.ratio_pct.pool}p_dev${split.ratio_pct.dev}p_test${split.ratio_pct.test}p_s${split.seed}
+tag: r_lab${split.ratio_pct.labeled}p_pool${split.ratio_pct.pool}p_d${split.ratio_pct.dev}p_t${split.ratio_pct.test}p

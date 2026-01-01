@@ -32,6 +32,7 @@ import pandas as pd
 
 from tensaku.tasks.base import BaseTask, TaskOutputs
 from tensaku.utils.strict_cfg import ConfigError, require_mapping, require_str, require_list, require_bool
+from tensaku.utils.memlog import snapshot as mem_snapshot
 from tensaku.contracts import validate_preds_detail, validate_gate_assign
 import tensaku.registry as registory
 from tensaku.pipelines.hitl import run_hitl_from_detail_df, build_gate_assign_df, create_empty_gate_assign_df
@@ -60,18 +61,41 @@ def _resolve_sampler_conf_key(cfg: Mapping[str, Any]) -> Optional[str]:
     name_l = name.lower()
 
     # score-free samplers
-    if name_l in {"random", "kmeans", "cluster", "clustering"}:
+    if name_l in {"random", "kmeans", "cluster", "clustering", "div_kmeans", "kcenter", "div_kcenter"}:
         return None
 
-    # score-required samplers
+    # explicit score key
     if "conf_key" in sampler_cfg:
         return require_str(sampler_cfg, "conf_key")
     if "by" in sampler_cfg:
-        # alias (keep explicitness; not a silent fallback)
+        # alias (explicit; not silent)
         return require_str(sampler_cfg, "by")
+
+    # derived score key (explicit naming convention)
+    # - legacy short names: msp/trust/entropy/margin/prob_margin/energy
+    # - extended names: unc_<key>, u2d_* (uncertainty->diversity), d2u_* (diversity->uncertainty)
+    #   NOTE: This is not a fallback; the key is encoded in the sampler *name* by contract.
+    known = {"msp", "trust", "entropy", "margin", "prob_margin", "energy"}
+    if name_l in known:
+        return name_l
+    if name_l.startswith("unc_"):
+        key = name_l[len("unc_") :]
+        if key in known:
+            return key
+    if name_l.startswith("u2d_"):
+        # u2d_<unc>_<div>
+        parts = name_l.split("_")
+        if len(parts) >= 3 and parts[1] in known:
+            return parts[1]
+    if name_l.startswith("d2u_"):
+        # d2u_<div>_<unc>
+        parts = name_l.split("_")
+        if len(parts) >= 3 and parts[-1] in known:
+            return parts[-1]
+
     raise ConfigError(
-        f"al.sampler.name='{name}' requires a score key. Set al.sampler.conf_key (e.g. 'msp', 'trust', ...)."
-        f"(This is intentionally decoupled from gate.conf_key/conf_keys.)"
+        f"al.sampler.name='{name}' requires a score key. Set al.sampler.conf_key (e.g. 'msp', 'trust', ...), "
+        f"or use a name that encodes the key (e.g. 'unc_msp'). (This is intentionally decoupled from gate.conf_key/conf_keys.)"
     )
 
 
@@ -173,6 +197,7 @@ class StandardSupervisedAlTask(BaseTask):
 
     def run_round(self, round_index: int, split: Any) -> TaskOutputs:
         logger.info("[Task] run_round=%s", round_index)
+        mem_snapshot(event="round_start", extra={"round": round_index})
 
         # 0. Execute registered hooks (if any)
         # 登録されたコンポーネントに 'on_round_start' メソッドがあればここで実行します
@@ -183,13 +208,16 @@ class StandardSupervisedAlTask(BaseTask):
 
         # 1) train
         self.step_train(round_index=round_index, split=split)
+        mem_snapshot(event="round_after_train", extra={"round": round_index})
 
         # 2) infer (pool/dev/test)
         df_detail, raw = self.step_infer(round_index=round_index, split=split)
+        mem_snapshot(event="round_after_infer", extra={"round": round_index, "n_detail": (0 if df_detail is None else int(len(df_detail)))})
         validate_preds_detail(df_detail)
 
         # 3) confidence estimation
         df_detail = self.step_confidence(round_index=round_index, split=split, df=df_detail, raw=raw)
+        mem_snapshot(event="round_after_conf", extra={"round": round_index})
         validate_preds_detail(df_detail)
 
         # save per-round preds_detail
@@ -198,6 +226,7 @@ class StandardSupervisedAlTask(BaseTask):
 
         # 4) HITL gate
         out = self.step_hitl(round_index=round_index, split=split, df=df_detail)
+        mem_snapshot(event="round_after_hitl", extra={"round": round_index})
 
         # 【追加】KMeans/Hybrid用にPoolの埋め込みを抽出してTaskOutputsに追加する
         # raw["pool"] が存在する場合のみ抽出
@@ -211,6 +240,8 @@ class StandardSupervisedAlTask(BaseTask):
                 pool_feature_ids = pool_raw["ids"]
 
         out = replace(out, pool_features=pool_features, pool_feature_ids=pool_feature_ids)
+
+        mem_snapshot(event="round_end", extra={"round": round_index})
 
         return out
 
@@ -364,6 +395,8 @@ class StandardSupervisedAlTask(BaseTask):
 
         # sampler scores
         pool_scores = _extract_pool_scores(df=df, conf_key=sampler_key) if sampler_key is not None else {}
+
+
 
         return TaskOutputs(metrics=metrics, pool_scores=pool_scores, detail_df=df)
     def _apply_estimator(self, name: str, estimator: Any, df: pd.DataFrame, raw: Any) -> pd.DataFrame:

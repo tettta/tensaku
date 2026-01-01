@@ -1,0 +1,3 @@
+name: "unc_msp"
+# name により sampler 側は by="msp", higher_is_better=False で固定
+# 標準Taskは sampler名から conf_key="msp" を導出し、conf_msp 列を要求します

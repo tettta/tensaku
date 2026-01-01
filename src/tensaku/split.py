@@ -21,8 +21,19 @@ import json
 import logging
 import os
 import random
+from pathlib import Path
 from collections import defaultdict
 from typing import Any, Dict, List, Optional
+
+from tensaku.data.filter_spec import FilterSpec
+from tensaku.data.label_space import LabelSpace
+from tensaku.data.manifest import (
+    SplitManifest,
+    build_signature_payload,
+    compute_signature,
+    file_stat_fingerprint,
+    write_manifest,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -198,6 +209,7 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
     data_dir = str(run_cfg["data_dir"])
     qid = str(data_cfg["qid"])
     label_key = str(data_cfg["label_key"])
+    id_key = str(data_cfg["id_key"])
     all_path = str(data_cfg["input_all"])
 
     seed = int(split_cfg["seed"])
@@ -227,16 +239,9 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
             raise KeyError(f"label_key '{label_key}' is missing in a record (qid={qid})")
         labels.append(_coerce_int_label_strict(r[label_key], label_key=label_key, qid=qid))
 
-    # label stats (Strict): allow missing labels (gaps), but enforce integer labels and min==0.
+    # Global label space (Strict): allow gaps, but enforce integer labels and min==0.
     # Many QIDs naturally lack some score values; we still size the classifier as (max+1).
-    label_min = min(labels)
-    label_max = max(labels)
-    unique_labels = sorted(set(labels))
-    if label_min != 0:
-        raise ValueError(
-            f"[{qid}] labels must start at 0 (Strict). got min={label_min}, max={label_max}"
-        )
-    num_labels = int(label_max) + 1
+    label_space = LabelSpace.from_labels(labels, require_start_at_zero=True, ctx=f"split:{qid}")
 
     n_total = len(rows)
 
@@ -295,26 +300,45 @@ def run(argv: Optional[List[str]], cfg: Dict[str, Any]) -> int:
     _write_jsonl(os.path.join(data_dir, "test.jsonl"), test)
     _write_jsonl(os.path.join(data_dir, "pool.jsonl"), pool)
 
-    meta = {
-        "qid": qid,
-        "data_dir": os.path.abspath(data_dir),
-        "input_all": os.path.abspath(all_path),
-        "label_key": label_key,
-        "label_stats": {
-            "label_min": label_min,
-            "label_max": label_max,
-            "num_labels": num_labels,
-            "unique_count": len(unique_labels),
-            "unique_labels": unique_labels,
-        },
-        "split": {
-            "seed": seed,
-            "stratify": stratify,
-            "mode": mode,
-            "n_train": n_train_sig,
-            "ratio": ratio_sig,  # n_train modeでは test/dev のみ
-        },
-        "counts": {"labeled": len(labeled), "dev": len(dev), "test": len(test), "pool": len(pool)},
+    abs_data_dir = os.path.abspath(data_dir)
+    abs_all = os.path.abspath(all_path)
+
+    fs = FilterSpec(qid=qid)
+    fp = file_stat_fingerprint(abs_all)
+    split_meta: Dict[str, Any] = {
+        "seed": seed,
+        "stratify": stratify,
+        "mode": mode,
+        "n_train": n_train_sig,
+        "ratio": ratio_sig,  # n_train mode: test/dev only
     }
-    _atomic_write_text(os.path.join(data_dir, "meta.json"), json.dumps(meta, ensure_ascii=False, indent=2) + "\n")
+    counts = {"labeled": len(labeled), "dev": len(dev), "test": len(test), "pool": len(pool)}
+
+    payload = build_signature_payload(
+        qid=qid,
+        data_dir=abs_data_dir,
+        input_all=abs_all,
+        label_key=label_key,
+        id_key=id_key,
+        filter_spec=fs,
+        split=split_meta,
+        input_all_fingerprint=fp,
+    )
+    sig = compute_signature(payload)
+
+    manifest = SplitManifest(
+        schema_version=2,
+        qid=qid,
+        data_dir=abs_data_dir,
+        input_all=abs_all,
+        label_key=label_key,
+        id_key=id_key,
+        filter_spec=fs,
+        label_space=label_space,
+        split=split_meta,
+        counts=counts,
+        input_all_fingerprint=fp,
+        signature=sig,
+    )
+    write_manifest(Path(os.path.join(data_dir, "meta.json")), manifest)
     return 0

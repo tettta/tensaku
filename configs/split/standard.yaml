@@ -1,8 +1,13 @@
+# configs/split/standard.yaml  (legacy; kept for backward compatibility)
 label_key: score
 seed: ${run.seed}
 stratify: true
 mode: n_train
 n_train: 50
 ratio:
-  test: 0.15
   dev: 0.15
+  dev_pct: 15
+  test: 0.15
+  test_pct: 15
+tag: n_lab${split.n_train}_dev${split.ratio.dev_pct}p_test${split.ratio.test_pct}p
+subdir: sp-${split.tag}_s${split.seed}

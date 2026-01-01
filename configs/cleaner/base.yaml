@@ -6,5 +6,6 @@ round_end:
   kinds: [array, logit, emb, prob, ckpt]
 
 experiment_end:
-  enabled: false
-  kinds: []
+  enabled: true
+  # Safety net: ensure cleanup even if AL loop breaks before round_end cleanup
+  kinds: [array, logit, emb, prob, ckpt]

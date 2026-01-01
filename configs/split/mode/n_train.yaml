@@ -1,0 +1,19 @@
+# @package split
+# configs/split/mode/n_train.yaml
+
+mode: n_train
+
+# labeled size
+n_train: 50
+
+# base split ratio (test/dev) for n_train mode (Strict)
+# NOTE: bootstrap.ensure_split_for_qid expects split.ratio.{test,dev} even in n_train mode.
+ratio:
+  test: 0.15
+  dev: 0.15
+
+# derived (for naming only)
+n_train_k: $${split.n_train}  # keep as int-like
+
+subdir: sp-n_lab${split.n_train}_dev15p_test15p_s${split.seed}
+tag: n_lab${split.n_train}

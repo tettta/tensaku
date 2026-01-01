@@ -20,6 +20,25 @@ import re
 import pandas as pd
 
 
+def ensure_split_dirs(root: Path) -> dict:
+    """Ensure standard output subdirectories under a root directory.
+
+    Rationale: keep outputs readable by separating file types.
+
+    Layout:
+      <root>/figures : image files (png, pdf, ...)
+      <root>/tables  : csv/tsv tables
+      <root>/meta    : json and other metadata
+
+    Returns a dict with keys: root, figures, tables, meta.
+    """
+    root = ensure_dir(Path(root))
+    figures = ensure_dir(root / "figures")
+    tables = ensure_dir(root / "tables")
+    meta = ensure_dir(root / "meta")
+    return {"root": root, "figures": figures, "tables": tables, "meta": meta}
+
+
 def setup_style() -> None:
     """Set a conservative matplotlib style without extra dependencies."""
     import matplotlib.pyplot as plt

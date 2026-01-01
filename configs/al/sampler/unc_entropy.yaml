@@ -1,0 +1,3 @@
+name: "unc_entropy"
+# entropy は「高いほど不確実」なので higher_is_better=True が内部で固定
+# 標準Taskは conf_entropy 列を要求します

@@ -1,12 +1,12 @@
-# configs/run/base.yaml
+# configs/run/debug.yaml
 seed: 42
-on_exist: overwrite   # ← 古い split を掴んで事故るのを避けるなら overwrite 推奨（運用で skip に戻すなら meta一致が前提）
+on_exist: overwrite
 save_logits: true
 save_predictions: true
 
-project_root: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}
+project_root: ${oc.env:TENSAKU_ROOT,.}
 outputs_root: ${run.project_root}/outputs
 out_dir: null
 data_dir: ${data.base_dir}
 
-tag: debug_init${split.n_train}_b${al.budget}_ep${train.epochs}
+tag: debug_${split.tag}_b${al.budget}_r${al.rounds}_ep${train.epochs}

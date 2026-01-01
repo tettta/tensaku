@@ -4,9 +4,22 @@ on_exist: skip   # /skip/overwrite/error
 save_logits: true
 save_predictions: true
 
-project_root: ${oc.env:TENSAKU_ROOT,${hydra:runtime.cwd}}
-outputs_root: ${run.project_root}/outputs
+# Integrated experiment recipe.
+# One of: al_only | hitl_only | al_hitl
+recipe: al_only
+
+# AL×HITL integrated stopping (used by al_hitl).
+U_stop: 50
+R_max: 30
+H_max: 1000000
+
+# Operational epsilon used for the integrated AL×HITL protocol (recipe=al_hitl).
+eps_cse_op: 0.02
+
+project_root: ${oc.env:TENSAKU_ROOT,.}
+outputs_root: /home/esakit25/work/tensaku/outputs
 out_dir: null
 data_dir: ${data.base_dir}
 
-tag: init${split.n_train}_b${al.budget}_ep${train.epochs}
+# split.mode に依存せず常に有効な tag（split.tag は mode 側で定義）
+tag: b${al.budget}_r${al.rounds}_ep${train.epochs}

@@ -31,6 +31,7 @@ from sklearn.metrics import cohen_kappa_score
 from tensaku.fs_core import ArtifactDir
 from tensaku.data.base import DatasetSplit
 from tensaku.models import create_model, create_tokenizer
+from tensaku.utils.memlog import snapshot as mem_snapshot
 
 LOGGER = logging.getLogger(__name__)
 
@@ -237,6 +238,9 @@ def train_core(
     rows_tr_raw = split.labeled
     rows_dv_raw = split.dev
 
+    # --- memlog ---
+    mem_snapshot(event="train_start", extra={"ckpt_dir": str(ckpt_dir.path), "n_labeled": len(rows_tr_raw), "n_dev": len(rows_dv_raw)})
+
     if not rows_tr_raw:
         LOGGER.error("Missing labeled data.")
         return 1, None
@@ -377,6 +381,7 @@ def train_core(
     best_qwk = -1.0
 
     for ep in range(1, epochs + 1):
+        mem_snapshot(event="train_epoch_start", extra={"epoch": ep, "epochs": epochs})
         model.train()
         train_loss_sum = 0.0
         n_batches = 0
@@ -456,6 +461,7 @@ def train_core(
                     record=record_best,
                 )
 
+    mem_snapshot(event="train_end", extra={"best_qwk": best_qwk})
     LOGGER.info("Training finished. Best QWK=%.4f", best_qwk)
 
     if return_model:

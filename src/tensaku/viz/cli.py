@@ -148,7 +148,9 @@ def _export_tau_evidence_for_experiments(
                     )
 
     if selected_rows:
-        pd.DataFrame(selected_rows).to_csv(out_root / "tau_selected_index.csv", index=False)
+        # Keep tables separated from json metadata.
+        (out_root / "tables").mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(selected_rows).to_csv(out_root / "tables" / "tau_selected_index.csv", index=False)
 
 
 def _conf_cols(df: pd.DataFrame) -> List[str]:
@@ -440,9 +442,10 @@ def _run_compare_one(
 
     df_agg = compare.aggregate_curves(df, x_col=x_col, y_cols=[metric], group_keys=["plot_label"])
 
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # Split outputs by file type to keep directories readable.
+    dirs = base.ensure_split_dirs(out_dir)
     stem = _stem_compare(metric=metric, x=x_col, qid=qid, tag=tags, sampler=samplers, seed=seeds, aggregate_seeds=aggregate_seeds, x_min=x_min, x_max=x_max)
-    out_csv = out_dir / f"{stem}.csv"
+    out_csv = dirs["tables"] / f"{stem}.csv"
     df_agg.to_csv(out_csv, index=False)
 
     fig, ax = plt.subplots(figsize=(8, 5))
@@ -455,7 +458,7 @@ def _run_compare_one(
         x_col=x_col,
     )
     fig.tight_layout()
-    out_png = out_dir / f"{stem}.png"
+    out_png = dirs["figures"] / f"{stem}.png"
     fig.savefig(out_png, dpi=160)
     plt.close(fig)
 

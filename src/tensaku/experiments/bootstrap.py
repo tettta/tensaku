@@ -283,19 +283,40 @@ def ensure_split_for_qid(
         [data_dir / "labeled.jsonl", data_dir / "dev.jsonl", data_dir / "test.jsonl"],
         label_key=expected["label_key"],
     )
-    meta_stats = meta.get("label_stats")
-    if meta_stats is None:
-        log.info("[bootstrap] meta.json missing label_stats -> computing & updating")
+    meta_stats_split = meta.get("label_stats_split")
+    meta_stats_legacy = meta.get("label_stats")
+    # 新形式: label_stats_split（split由来）を優先。無ければ旧形式 label_stats を参照する。
+    meta_stats_for_check = meta_stats_split if isinstance(meta_stats_split, dict) else meta_stats_legacy
+
+    if meta_stats_for_check is None:
+        log.info("[bootstrap] meta.json missing label_stats -> computing & updating (label_stats + label_stats_split)")
+        # 後方互換: label_stats も埋める（他モジュールが参照している可能性を考慮）
         meta["label_stats"] = computed_stats
+        meta["label_stats_split"] = computed_stats
         _atomic_write_json(meta_path, meta)
-    elif isinstance(meta_stats, dict):
-        # If meta exists but disagrees with actual files, treat as corruption.
-        if dict(meta_stats) != computed_stats:
-            raise RuntimeError(
-                "meta.json label_stats mismatch with split files (possible corruption). "
-                "Set run.on_exist=overwrite to regenerate. "
-                f"meta={meta_stats} computed={computed_stats}"
-            )
+    elif isinstance(meta_stats_for_check, dict):
+        if dict(meta_stats_for_check) != computed_stats:
+            # split結果として dev/test/labeled に全ラベルが出現しないケースがあり得るため、
+            # mismatch は「腐敗」と断定せず、split実態（computed）を正として meta を更新する。
+            if isinstance(meta_stats_split, dict):
+                log.warning(
+                    "[bootstrap] meta.json label_stats_split differs from actual split files -> updating meta.json "
+                    "meta=%s computed=%s",
+                    meta_stats_split,
+                    computed_stats,
+                )
+                meta["label_stats_split"] = computed_stats
+            else:
+                log.warning(
+                    "[bootstrap] meta.json label_stats differs from actual split files -> writing label_stats_split (legacy label_stats kept) "
+                    "meta=%s computed=%s",
+                    meta_stats_legacy,
+                    computed_stats,
+                )
+                meta["label_stats_split"] = computed_stats
+                if meta_stats_legacy is None:
+                    meta["label_stats"] = computed_stats
+            _atomic_write_json(meta_path, meta)
     else:
         raise RuntimeError("meta.json label_stats must be a mapping")
 
@@ -309,11 +330,19 @@ def ensure_split_for_qid(
             log.info("[bootstrap] cfg.model.num_labels is None -> skip validation (use split label_stats)")
         else:
             cfg_num_labels = require_int(model_cfg, ("num_labels",), ctx="cfg.model")
-            if cfg_num_labels != int(computed_stats["num_labels"]):
+            split_num_labels = int(computed_stats["num_labels"])
+            # Strict: splitのクラス数より小さいのは破綻（出力次元が不足）
+            #        大きいのは許容（未出現ラベルがあるだけ）
+            if cfg_num_labels < split_num_labels:
                 raise ConfigError(
-                    f"cfg.model.num_labels={cfg_num_labels} does not match split label_stats.num_labels={computed_stats['num_labels']} "
+                    f"cfg.model.num_labels={cfg_num_labels} is smaller than split label_stats.num_labels={split_num_labels} "
                     "(Strict: fix config or regenerate split)"
                 )
+            log.info(
+                "[bootstrap] cfg.model.num_labels=%d >= split label_stats.num_labels=%d -> ok",
+                cfg_num_labels,
+                split_num_labels,
+            )
 
     log.info("[bootstrap] split ok: %s", data_dir)
     return data_dir

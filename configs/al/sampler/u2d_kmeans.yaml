@@ -1,0 +1,9 @@
+name: "u2d_kmeans"
+
+# --- uncertainty stage (score key) ---
+conf_key: "trust"          # "msp" | "trust" | "entropy" | "energy" | ...
+higher_is_better: false    # trust/mspなら false, entropy/energyなら true
+
+# --- diversity stage (kmeans) ---
+k: 200                     # クラスタ数（Noneなら budget だが、明示推奨）
+sub_budget_ratio: 3.0

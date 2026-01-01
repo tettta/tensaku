@@ -1,0 +1,16 @@
+# configs/split/base.yaml
+# @package split
+seed: 42
+stratify: true
+
+# Either set split.ratio OR split.n_train (Strict). One of the mode configs should override.
+ratio: null
+n_train: null
+base_test: null
+base_dev: null
+
+# Provide safe defaults to avoid missing-key errors during hydra.run.dir composition.
+# Mode configs should override these with informative names.
+mode: n_train
+subdir: sp-${split.mode}_s${split.seed}
+tag: ${split.mode}

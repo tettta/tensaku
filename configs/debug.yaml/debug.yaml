@@ -1,5 +1,0 @@
-epochs: 1
-batch_size: 2
-lr_full: 2.0e-05
-lr_frozen: 0.0005
-patience: 1

@@ -1,5 +1,8 @@
+# configs/split/few_shot.yaml (legacy; kept for backward compatibility)
 defaults:
   - standard
   - _self_
 
 n_train: 10
+tag: n_lab${split.n_train}_dev${split.ratio.dev_pct}p_test${split.ratio.test_pct}p
+subdir: sp-${split.tag}_s${split.seed}

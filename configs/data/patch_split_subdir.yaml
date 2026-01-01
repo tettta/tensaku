@@ -1,0 +1,5 @@
+# configs/data/patch_split_subdir.yaml
+# Backward-compat overlay: align base_dir/input_all with run.project_root and q-{qid} layout.
+
+base_dir: ${run.project_root}/${data.data_root}/q-${data.qid}/${split.subdir}
+input_all: ${run.project_root}/${data.data_root}/all.jsonl

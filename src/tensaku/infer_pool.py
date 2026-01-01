@@ -32,6 +32,51 @@ from tensaku.utils.strict_cfg import ConfigError, require_int, require_mapping, 
 
 LOGGER = logging.getLogger(__name__)
 
+MEM_LOGGER = logging.getLogger("tensaku.mem")
+
+
+def _read_proc_status(pid: int) -> dict:
+    """/proc/<pid>/status から主要メモリ値を読む（Linux専用）。"""
+    rss_kb = None
+    hwm_kb = None
+    vms_kb = None
+    threads = None
+    try:
+        with open(f"/proc/{pid}/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss_kb = int(line.split()[1])
+                elif line.startswith("VmHWM:"):
+                    hwm_kb = int(line.split()[1])
+                elif line.startswith("VmSize:"):
+                    vms_kb = int(line.split()[1])
+                elif line.startswith("Threads:"):
+                    threads = int(line.split()[1])
+    except Exception:
+        pass
+    return {"rss_kb": rss_kb, "hwm_kb": hwm_kb, "vms_kb": vms_kb, "threads": threads}
+
+
+def _mem_event(event: str, extra: dict | None = None) -> None:
+    """tensaku.mem ロガーへ、メモリ計測イベント（JSON）を出す。本文などの重い情報は絶対に入れない。"""
+    if not MEM_LOGGER.isEnabledFor(logging.DEBUG):
+        return
+    pid = os.getpid()
+    info = _read_proc_status(pid)
+    payload = {
+        "event": event,
+        "ts": time.strftime("%F %T"),
+        "pid": pid,
+        **info,
+        "extra": (extra or {}),
+    }
+    try:
+        MEM_LOGGER.debug(json.dumps(payload, ensure_ascii=False))
+    except Exception:
+        # ログが壊れて実験が止まるのを防ぐ（計測はベストエフォート）
+        MEM_LOGGER.debug('{"event":"memlog_failed"}')
+
+
 
 def _read_jsonl(path: str) -> List[dict]:
     rows: List[dict] = []
@@ -181,20 +226,52 @@ def infer_core(
 
     for split_name, rows in splits_to_infer.items():
         LOGGER.info(f"Inferring split: {split_name} (n={len(rows)})")
+        _mem_event("infer_split_start", {"round": round_index, "split": split_name, "n": len(rows)})
+
+        want_logits = (split_name != "labeled")
+
+
 
         logits, labels, embs = predict_with_emb(
+
+
             model,
+
+
             rows,
+
+
             tokenizer=tokenizer,
+
+
             bs=batch_size,
+
+
             max_len=max_len,
+
+
             device=dev.type,              # existing implementation expects str
+
+
             label_key=label_key,
+
+
             text_key_primary=text_key_primary,
+
+
+            return_logits=True,
+
+
         )
+        _mem_event("infer_split_after_predict", {
+            "round": round_index,
+            "split": split_name,
+            "n": len(rows),
+            "logits_shape": list(getattr(logits, "shape", ())),
+            "embs_shape": list(getattr(embs, "shape", ())),
+        })
 
-        y_pred = logits.argmax(axis=-1)
-
+        y_pred = logits.argmax(axis=-1)  # logits は常に生成する（dtype object 混入を防止）
         outputs[split_name] = {
             "rows": rows,
             "logits": logits,
@@ -210,16 +287,25 @@ def infer_core(
                 "kind=logit/emb requires round_index. Use layout.round_infer_dir(round=...)."
             )
 
-        (out_dir / f"{split_name}_logits.npy").save_npy(
-            logits, record=True, kind="logit", round_index=round_index, meta={"split": split_name}
-        )
+        if split_name != "labeled" and logits is not None:
+
+
+            (out_dir / f"{split_name}_logits.npy").save_npy(
+
+
+                logits, record=True, kind="logit", round_index=round_index, meta={"split": split_name}
+
+
+            )
         (out_dir / f"{split_name}_embs.npy").save_npy(
             embs, record=True, kind="emb", round_index=round_index, meta={"split": split_name}
         )
+        _mem_event("infer_split_after_save", {"round": round_index, "split": split_name, "n": len(rows)})
 
     # ---- DataFrame 構築 ----
     dfs: List[pd.DataFrame] = []
     raw_outputs: Dict[str, Any] = {}
+    _mem_event("infer_df_build_start", {"round": round_index, "splits": list(outputs.keys())})
 
     for split_name, data in outputs.items():
         rows = data["rows"]
@@ -238,6 +324,7 @@ def infer_core(
             df_split["y_true"] = data["labels"]
 
         dfs.append(df_split)
+        _mem_event("infer_df_split_done", {"round": round_index, "split": split_name, "n": len(rows)})
 
         if return_raw_outputs:
             raw_outputs[split_name] = {
@@ -248,6 +335,7 @@ def infer_core(
                 "y_pred": data.get("y_pred"),
             }
 
+    _mem_event("infer_df_build_end", {"round": round_index, "n_rows": int(sum(len(v.get("rows", [])) for v in outputs.values()))})
     final_df = pd.concat(dfs, axis=0, ignore_index=True) if dfs else pd.DataFrame()
 
     # ---- preds_detail.csv（台帳に記録）----

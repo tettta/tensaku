@@ -1,0 +1,3 @@
+name: "unc_trust"
+# name により sampler 側は by="trust", higher_is_better=False で固定
+# 標準Taskは sampler名から conf_key="trust" を導出し、conf_trust 列を要求します

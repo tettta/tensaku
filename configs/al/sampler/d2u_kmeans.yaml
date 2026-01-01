@@ -1,0 +1,8 @@
+name: "d2u_kmeans"
+
+# --- kmeans stage ---
+k: 200                     # クラスタ数（Noneなら budget）
+
+# --- uncertainty stage (within each cluster pick best by score) ---
+conf_key: "trust"          # standardタスクが pool_scores を作るために必要（conf_trust列が必要）
+higher_is_better: false    # trust/mspなら false

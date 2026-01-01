@@ -216,9 +216,29 @@ def aggregate_curves(
     return agg
 
 
+SUMMARY_DIRNAME = "summary"
+
+
+def get_summary_dir(project_root: Path, qid: str) -> Path:
+    """Directory for visualization summaries.
+
+    We standardize the directory name to "summary" because outputs include
+    not only plots but also tables and metadata.
+
+    Path:
+      outputs/<qid>/summary
+    """
+    return base.ensure_dir((project_root / "outputs" / qid / SUMMARY_DIRNAME).resolve())
+
+
 def get_summary_plots_dir(project_root: Path, qid: str) -> Path:
-    return base.ensure_dir((project_root / "outputs" / qid / "summary_plots").resolve())
+    """Backward-compatible alias.
+
+    Older code used "summary_plots"; keep the API name, but write to the
+    standardized directory "summary".
+    """
+    return get_summary_dir(project_root, qid)
 
 
 def get_by_sampler_plots_dir(project_root: Path, qid: str, sampler: str) -> Path:
-    return base.ensure_dir((get_summary_plots_dir(project_root, qid) / "by_sampler" / str(sampler)).resolve())
+    return base.ensure_dir((get_summary_dir(project_root, qid) / "by_sampler" / str(sampler)).resolve())

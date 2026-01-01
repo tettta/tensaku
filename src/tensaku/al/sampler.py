@@ -6,8 +6,7 @@
 @policy:
   - フォールバック（サイレントに別サンプラーへ切替）はしない。必要条件が満たされない場合は例外で停止。
   - kmeans/hybrid は「ファイルパスを知らない」純粋ロジック。埋め込みは pipeline/task 側から features/feature_ids として渡す。
-  - config 上は "uncertainty" を基本的に使わず、"msp" / "trust" / "entropy" / "random" を選ぶ前提。
-  - round=0 の挙動は kmeans/hybrid 側の round0 で明示指定できる（"random"/"msp"/"trust"/"entropy"）。
+  - config 上は "uncertainty" を基本的に使わず、"msp" / "trust" / "entropy" を選ぶ前提。
 """
 
 from __future__ import annotations
@@ -25,6 +24,24 @@ from tensaku.registry import register as _register_global, create as _registry_c
 LOGGER = logging.getLogger(__name__)
 
 SAMPLER_REGISTRY_PREFIX = "sampler/"
+
+
+def _infer_higher_is_better_from_conf_key(conf_key: str) -> bool:
+    """Infer score direction from a confidence/uncertainty key.
+
+    Policy:
+      - confidence-like (msp/trust/margin/prob_margin): low => more informative => higher_is_better=False
+      - uncertainty-like (entropy/energy): high => more informative => higher_is_better=True
+
+    NOTE:
+      - This is used only when cfg does not explicitly set higher_is_better.
+      - If you introduce a new conf key, prefer setting higher_is_better explicitly in cfg.
+    """
+    k = (conf_key or "").strip().lower()
+    if k in {"entropy", "energy"}:
+        return True
+    # default: choose low-score items first
+    return False
 
 
 def register_sampler(name: str, *, override: bool = False):
@@ -185,20 +202,27 @@ class UncertaintySampler(BaseSampler):
 
 
 @dataclass
-class ClusteringSampler(BaseSampler):
+class DensityWeightedUncertaintySampler(BaseSampler):
+    """Density-weighted uncertainty sampler.
+
+    代表例: "density-weighted uncertainty" (uncertainty × density).
+
+    直感:
+      - 不確実性 top-k は分布の端に偏りやすい
+      - そこで、近傍が多い（=dense / 代表的）な点を優先して選び、
+        "ラベル効率" を上げる狙い
+
+    要件:
+      - scores（pool_scores）と features（埋め込み）が必要
+      - higher_is_better=False のときは "低いほど良い" score を自動で反転して扱う
     """
-    K-Means クラスタリングに基づく多様性サンプラー（Diversity Sampler）。
 
-    - features: (N, D) 埋め込み（pool もしくは pool を含む集合）
-    - feature_ids: 長さ N の ID 列（features の行と対応）
-
-    round=0 など埋め込みが未提供のケースのために round0 を持つ。
-      round0 in {"random","msp","trust","entropy"}（基本方針として "uncertainty" は使わない）
-    """
-
-    name: str = "kmeans"
-    k: Optional[int] = None  # クラスタ数（Noneなら budget）
-    round0: str = "random"   # "random" / "msp" / "trust" / "entropy"
+    name: str = "unc_density"
+    k_nn: int = 10
+    metric: str = "cosine"  # 'cosine'|'euclidean'
+    alpha: float = 1.0  # uncertainty weight
+    beta: float = 1.0  # density weight
+    higher_is_better: bool = False
 
     def select(
         self,
@@ -212,9 +236,124 @@ class ClusteringSampler(BaseSampler):
         if budget <= 0 or state.n_pool <= 0:
             return []
 
-        # round=0 は埋め込み無し運用を許容（明示設定で分岐）
-        if state.round_index == 0 and (features is None or feature_ids is None):
-            return _select_round0(mode=self.round0, seed=self.seed, state=state, scores=scores, budget=budget)
+        if scores is None or not scores:
+            raise RuntimeError("[DensityWeightedUncertaintySampler] scores is required (provide pool_scores).")
+        if features is None or feature_ids is None:
+            raise RuntimeError("[DensityWeightedUncertaintySampler] requires 'features' and 'feature_ids'.")
+
+        feat, ids = _normalize_features(features, feature_ids)
+        id_to_idx = {ids[i]: i for i in range(len(ids))}
+        target_ids = [pid for pid in state.pool_ids if pid in id_to_idx and pid in scores]
+        if not target_ids:
+            raise RuntimeError("[DensityWeightedUncertaintySampler] no usable ids (need intersection of pool_ids, feature_ids, scores).")
+
+        X = feat[[id_to_idx[i] for i in target_ids], :].astype(float)
+        n = len(target_ids)
+        k = min(int(budget), n)
+        k_nn = max(1, min(int(self.k_nn), max(1, n - 1)))
+
+        metric = (self.metric or "cosine").lower()
+        if metric not in {"cosine", "euclidean"}:
+            raise ValueError(f"[DensityWeightedUncertaintySampler] unsupported metric={self.metric!r}")
+
+        if not SKLEARN_AVAILABLE:
+            raise RuntimeError("[DensityWeightedUncertaintySampler] scikit-learn is required (NearestNeighbors), but unavailable.")
+        from sklearn.neighbors import NearestNeighbors  # type: ignore
+
+        # Density via average similarity to kNN
+        if metric == "cosine":
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            norms = np.where(norms == 0.0, 1.0, norms)
+            X_use = X / norms
+        else:
+            X_use = X
+
+        nn = NearestNeighbors(n_neighbors=min(k_nn + 1, n), metric=metric)
+        nn.fit(X_use)
+        dist, _ = nn.kneighbors(X_use, return_distance=True)
+        # drop self (distance 0)
+        dist = dist[:, 1:]
+        if metric == "cosine":
+            sim = 1.0 - dist
+            density = sim.mean(axis=1)
+        else:
+            # convert distance to a bounded similarity (avoid division by zero)
+            density = 1.0 / (1.0 + dist.mean(axis=1))
+
+        # Uncertainty term
+        s = np.array([float(scores[pid]) for pid in target_ids], dtype=float)
+        unc = s if self.higher_is_better else (-s)
+
+        def _z(x: np.ndarray) -> np.ndarray:
+            mu = float(x.mean())
+            sd = float(x.std())
+            if sd == 0.0:
+                return x - mu
+            return (x - mu) / sd
+
+        comb = float(self.alpha) * _z(unc) + float(self.beta) * _z(density)
+        order = np.argsort(-comb)  # higher better
+        selected = [target_ids[int(i)] for i in order[:k]]
+        selected = list(dict.fromkeys(selected))
+        if len(selected) > budget:
+            selected = selected[:budget]
+
+        LOGGER.info(
+            "[DensityWeightedUncertaintySampler] metric=%s k_nn=%d hib=%s selected=%d",
+            metric,
+            k_nn,
+            bool(self.higher_is_better),
+            len(selected),
+        )
+        return selected
+
+
+@dataclass
+class NotImplementedSampler(BaseSampler):
+    """Placeholder sampler for future extensions.
+
+    This sampler is intentionally strict: selecting with it raises NotImplementedError.
+    Use it as a reminder to implement a sampler once the required artifacts exist.
+    """
+
+    name: str = "not_implemented"
+    reason: str = ""
+
+    def select(
+        self,
+        state: ALState,
+        scores: Optional[Mapping[Any, float]],
+        budget: int,
+        *,
+        features: Optional[np.ndarray] = None,
+        feature_ids: Optional[Sequence[Any]] = None,
+    ) -> List[Any]:
+        raise NotImplementedError(f"Sampler '{self.name}' is not implemented yet. {self.reason}")
+
+
+@dataclass
+class ClusteringSampler(BaseSampler):
+    """
+    K-Means クラスタリングに基づく多様性サンプラー（Diversity Sampler）。
+
+    - features: (N, D) 埋め込み（pool もしくは pool を含む集合）
+    - feature_ids: 長さ N の ID 列（features の行と対応）
+    """
+
+    name: str = "kmeans"
+    k: Optional[int] = None  # クラスタ数（Noneなら budget）
+
+    def select(
+        self,
+        state: ALState,
+        scores: Optional[Mapping[Any, float]],
+        budget: int,
+        *,
+        features: Optional[np.ndarray] = None,
+        feature_ids: Optional[Sequence[Any]] = None,
+    ) -> List[Any]:
+        if budget <= 0 or state.n_pool <= 0:
+            return []
 
         if not SKLEARN_AVAILABLE:
             raise RuntimeError("[ClusteringSampler] scikit-learn is required for kmeans sampler, but unavailable.")
@@ -269,22 +408,19 @@ class ClusteringSampler(BaseSampler):
 
 
 @dataclass
-class HybridSampler(BaseSampler):
+class KCenterSampler(BaseSampler):
+    """k-center greedy による多様性サンプラー（core-set / coverage）。
+
+    目的:
+      - 選択集合が pool 全体をできるだけカバーする（最遠点を順に追加）
+
+    実装方針（最小・堅牢）:
+      - metric='cosine' or 'euclidean' を選べる
+      - 初期点は seed により決定論的（random）
     """
-    ハイブリッドサンプリング（Uncertainty + Diversity）。
 
-    1) scores で候補を絞り込み（sub_budget_ratio 倍）
-    2) 候補の features で KMeans を回し、多様性を確保して budget 件返す
-
-    round0:
-      - round=0 は埋め込み無しでも動くように、round0 で明示指定したサンプラーを使う。
-      - round0 in {"random","msp","trust","entropy"}（基本方針として "uncertainty" は使わない）
-    """
-
-    name: str = "hybrid"
-    sub_budget_ratio: float = 5.0
-    k: Optional[int] = None
-    round0: str = "msp"  # round0 は “低確信度” を取るケースが多い想定で msp をデフォルト
+    name: str = "kcenter"
+    metric: str = "cosine"  # 'cosine' | 'euclidean'
 
     def select(
         self,
@@ -298,9 +434,105 @@ class HybridSampler(BaseSampler):
         if budget <= 0 or state.n_pool <= 0:
             return []
 
-        # round=0 は埋め込み無し運用を許容（明示設定で分岐）
-        if state.round_index == 0 and (features is None or feature_ids is None):
-            return _select_round0(mode=self.round0, seed=self.seed, state=state, scores=scores, budget=budget)
+        if features is None or feature_ids is None:
+            raise RuntimeError(
+                "KCenterSampler.select requires 'features' and 'feature_ids'. Provide embeddings from the task/pipeline side."
+            )
+
+        feat, ids = _normalize_features(features, feature_ids)
+        id_to_idx = {ids[i]: i for i in range(len(ids))}
+        target_ids = [pid for pid in state.pool_ids if pid in id_to_idx]
+        if not target_ids:
+            raise RuntimeError("[KCenterSampler] no intersection between pool_ids and feature_ids.")
+
+        X = feat[[id_to_idx[i] for i in target_ids], :].astype(float)
+
+        # metric preparation
+        metric = (self.metric or "cosine").lower()
+        if metric not in {"cosine", "euclidean"}:
+            raise ValueError(f"[KCenterSampler] unsupported metric={self.metric!r} (expected 'cosine'|'euclidean')")
+
+        if metric == "cosine":
+            # normalize rows to unit length; avoid div-by-zero
+            norms = np.linalg.norm(X, axis=1, keepdims=True)
+            norms = np.where(norms == 0.0, 1.0, norms)
+            Xn = X / norms
+            # distance = 1 - cosine_similarity
+            def _dist_to_set(x: np.ndarray, S: np.ndarray) -> np.ndarray:
+                # returns min distance to set for each row in x
+                sim = x @ S.T
+                d = 1.0 - sim
+                return d.min(axis=1)
+
+            X_use = Xn
+        else:
+            def _dist_to_set(x: np.ndarray, S: np.ndarray) -> np.ndarray:
+                # ||x - s|| for each s; take min
+                # shapes: x(N,D), S(k,D)
+                dif = x[:, None, :] - S[None, :, :]
+                d = np.linalg.norm(dif, axis=2)
+                return d.min(axis=1)
+
+            X_use = X
+
+        n = len(target_ids)
+        k = min(int(budget), n)
+
+        # initial point: deterministic random over target_ids
+        idxs = list(range(n))
+        self._rng.shuffle(idxs)
+        first = idxs[0]
+        selected_idx = [first]
+
+        # maintain min-distance to selected set
+        S = X_use[np.array(selected_idx, dtype=int)]
+        min_d = _dist_to_set(X_use, S)
+
+        while len(selected_idx) < k:
+            # pick farthest point
+            cand = int(np.argmax(min_d))
+            if cand in selected_idx:
+                # numerical tie/degenerate; pick next best
+                order = np.argsort(-min_d)
+                cand = next(int(i) for i in order if int(i) not in selected_idx)
+            selected_idx.append(cand)
+            S = X_use[np.array(selected_idx, dtype=int)]
+            min_d = np.minimum(min_d, _dist_to_set(X_use, X_use[np.array([cand], dtype=int)]))
+
+        selected = [target_ids[i] for i in selected_idx]
+        selected = list(dict.fromkeys(selected))
+        if len(selected) > budget:
+            selected = selected[:budget]
+
+        LOGGER.info("[KCenterSampler] metric=%s selected=%d", metric, len(selected))
+        return selected
+
+
+@dataclass
+class HybridSampler(BaseSampler):
+    """
+    ハイブリッドサンプリング（Uncertainty + Diversity）。
+
+    1) scores で候補を絞り込み（sub_budget_ratio 倍）
+    2) 候補の features で KMeans を回し、多様性を確保して budget 件返す
+    """
+
+    name: str = "hybrid"
+    sub_budget_ratio: float = 5.0
+    k: Optional[int] = None
+    higher_is_better: Optional[bool] = None  # None のときは推定（後方互換）
+
+    def select(
+        self,
+        state: ALState,
+        scores: Optional[Mapping[Any, float]],
+        budget: int,
+        *,
+        features: Optional[np.ndarray] = None,
+        feature_ids: Optional[Sequence[Any]] = None,
+    ) -> List[Any]:
+        if budget <= 0 or state.n_pool <= 0:
+            return []
 
         if not SKLEARN_AVAILABLE:
             raise RuntimeError("[HybridSampler] scikit-learn is required for hybrid sampler, but unavailable.")
@@ -322,7 +554,9 @@ class HybridSampler(BaseSampler):
         #   どれかは scores の意味次第なので、ここは "mode 推定" のみにしておく。
         #   ※ pipeline側が「選びたい順に大きい値」へ変換する設計でもOK。その場合は higher_is_better=True を cfg で渡すのが理想。
         #   いまは保守的に「msp/trust は低いほど、entropy は高いほど」とする。
-        mode = _infer_score_mode_from_cfg_like(scores_hint_name=None)
+        # Prefer explicit direction; else keep backward-compat default (False: low scores first).
+        hib = self.higher_is_better if self.higher_is_better is not None else False
+        mode = {"higher_is_better": bool(hib)}
 
         pool_scores: List[Tuple[Any, float]] = []
         for pid in state.pool_ids:
@@ -382,6 +616,86 @@ class HybridSampler(BaseSampler):
         return selected
 
 
+@dataclass
+class DivThenUncertaintySampler(BaseSampler):
+    """Diversity -> Uncertainty (D2U).
+
+    手順:
+      1) features で KMeans を回してクラスタを作る（多様性確保）
+      2) 各クラスタから 1 点ずつ、scores に基づいて選ぶ（不確実性/低確信度など）
+
+    用途:
+      - kmeans が random に負けるケースで、"中心"ではなく"境界/難所"を拾いたい
+      - uncertainty top-k が偏るケースで、diversity を強制したい
+    """
+
+    name: str = "d2u"
+    k: Optional[int] = None
+    higher_is_better: Optional[bool] = None
+
+    def select(
+        self,
+        state: ALState,
+        scores: Optional[Mapping[Any, float]],
+        budget: int,
+        *,
+        features: Optional[np.ndarray] = None,
+        feature_ids: Optional[Sequence[Any]] = None,
+    ) -> List[Any]:
+        if budget <= 0 or state.n_pool <= 0:
+            return []
+
+        if not SKLEARN_AVAILABLE:
+            raise RuntimeError("[DivThenUncertaintySampler] scikit-learn is required, but unavailable.")
+        if scores is None or not scores:
+            raise RuntimeError("[DivThenUncertaintySampler] scores is required (provide pool_scores).")
+        if features is None or feature_ids is None:
+            raise RuntimeError("[DivThenUncertaintySampler] requires 'features' and 'feature_ids'.")
+
+        feat, ids = _normalize_features(features, feature_ids)
+        id_to_idx = {ids[i]: i for i in range(len(ids))}
+        target_ids = [pid for pid in state.pool_ids if pid in id_to_idx and pid in scores]
+        if not target_ids:
+            raise RuntimeError("[DivThenUncertaintySampler] no usable ids (need intersection of pool_ids, feature_ids, scores).")
+
+        X = feat[[id_to_idx[i] for i in target_ids], :]
+        n = len(target_ids)
+        n_clusters = self.k if self.k is not None else budget
+        n_clusters = max(1, min(int(n_clusters), n))
+
+        kmeans = KMeans(n_clusters=n_clusters, random_state=self.seed, n_init="auto", max_iter=300)
+        labels = kmeans.fit_predict(X)
+
+        # direction
+        hib = self.higher_is_better
+        if hib is None:
+            # infer from any key; task extracted score already; best effort: default False
+            hib = False
+
+        selected: List[Any] = []
+        for c in range(n_clusters):
+            idxs = np.where(labels == c)[0]
+            if idxs.size == 0:
+                continue
+            # pick best score within cluster
+            cand_ids = [target_ids[int(i)] for i in idxs]
+            cand_ids.sort(key=lambda pid: float(scores[pid]), reverse=bool(hib))
+            selected.append(cand_ids[0])
+
+        selected = list(dict.fromkeys(selected))
+        if len(selected) > budget:
+            self._rng.shuffle(selected)
+            selected = selected[:budget]
+
+        LOGGER.info(
+            "[DivThenUncertaintySampler] k=%d higher_is_better=%s selected=%d",
+            n_clusters,
+            bool(hib),
+            len(selected),
+        )
+        return selected
+
+
 # =============================================================================
 # Helpers
 # =============================================================================
@@ -398,57 +712,6 @@ def _normalize_features(features: np.ndarray, feature_ids: Sequence[Any]) -> Tup
         )
     ids = list(feature_ids)
     return features, ids
-
-
-def _select_round0(
-    *,
-    mode: str,
-    seed: Optional[int],
-    state: ALState,
-    scores: Optional[Mapping[Any, float]],
-    budget: int,
-) -> List[Any]:
-    """
-    round=0 用の明示的分岐。
-    config 上は "uncertainty" を使わず、mode として "msp"/"trust"/"entropy"/"random" を想定。
-    """
-    m = (mode or "random").lower()
-
-    if m == "random":
-        LOGGER.info("[round0] mode=random -> RandomSampler")
-        return RandomSampler(seed=seed).select(state=state, scores=scores, budget=budget)
-
-    if m in {"msp", "trust"}:
-        # 低確信度を優先（昇順）
-        LOGGER.info("[round0] mode=%s -> UncertaintySampler(by=%s, higher_is_better=False)", m, m)
-        return UncertaintySampler(seed=seed, by=m, higher_is_better=False).select(
-            state=state, scores=scores, budget=budget
-        )
-
-    if m in {"entropy", "energy"}:
-        # 高不確実性を優先（降順）
-        LOGGER.info("[round0] mode=%s -> UncertaintySampler(by=%s, higher_is_better=True)", m, m)
-        return UncertaintySampler(seed=seed, by=m, higher_is_better=True).select(
-            state=state, scores=scores, budget=budget
-        )
-
-    raise ValueError(f"[round0] unsupported mode={mode!r} (expected 'random'/'msp'/'trust'/'entropy')")
-
-
-def _infer_score_mode_from_cfg_like(scores_hint_name: Optional[str]) -> Dict[str, Any]:
-    """
-    現段階では sampler 側が conf_key を知らないこともあるため、
-    “超保守的” な推定関数として残している（将来は cfg から higher_is_better を渡すのが理想）。
-
-    今回はデフォルトを「低確信度優先（昇順）」に寄せる。
-    """
-    # 将来: scores_hint_name が "entropy" 等なら True にするなど
-    return {"higher_is_better": False}
-
-
-# =============================================================================
-# Registry factories (cfg -> sampler)
-# =============================================================================
 
 
 @register_sampler("random")
@@ -468,7 +731,163 @@ def _factory_trust_sampler(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, 
 
 @register_sampler("entropy")
 def _factory_entropy_sampler(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
-    return UncertaintySampler(seed=seed, by="entropy", higher_is_better=False)
+    # entropy: higher => more uncertain
+    return UncertaintySampler(seed=seed, by="entropy", higher_is_better=True)
+
+
+# =============================================================================
+# Extended naming (extensible)
+#
+# - Prefer *concept first* naming:
+#     unc_* : uncertainty/confidence based
+#     div_* : diversity based
+#     u2d_* : uncertainty -> diversity
+#     d2u_* : diversity -> uncertainty
+# - Keep legacy names (msp/trust/entropy/kmeans/hybrid) working.
+# - For future keys, use generic 'unc' / 'hyb_*' + explicit conf_key.
+# =============================================================================
+
+
+@register_sampler("unc")
+def _factory_unc_generic(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    # Strict: conf_key must be provided (either directly or derived upstream).
+    conf_key = sampler_cfg.get("conf_key", sampler_cfg.get("by", None))
+    if conf_key is None:
+        raise ValueError("sampler 'unc' requires sampler_cfg.conf_key (e.g. 'msp', 'margin', 'entropy').")
+    conf_key = str(conf_key)
+    hib = sampler_cfg.get("higher_is_better", None)
+    higher_is_better = bool(hib) if isinstance(hib, bool) else _infer_higher_is_better_from_conf_key(conf_key)
+    return UncertaintySampler(seed=seed, by=conf_key, higher_is_better=higher_is_better)
+
+
+@register_sampler("unc_msp")
+def _factory_unc_msp(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="msp", higher_is_better=False)
+
+
+@register_sampler("unc_trust")
+def _factory_unc_trust(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="trust", higher_is_better=False)
+
+
+@register_sampler("unc_margin")
+def _factory_unc_margin(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="margin", higher_is_better=False)
+
+
+@register_sampler("unc_prob_margin")
+def _factory_unc_prob_margin(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="prob_margin", higher_is_better=False)
+
+
+@register_sampler("unc_entropy")
+def _factory_unc_entropy(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="entropy", higher_is_better=True)
+
+
+@register_sampler("unc_energy")
+def _factory_unc_energy(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return UncertaintySampler(seed=seed, by="energy", higher_is_better=True)
+
+
+@register_sampler("unc_density")
+def _factory_unc_density(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    k_nn = int(sampler_cfg.get("k_nn", 10))
+    metric = str(sampler_cfg.get("metric", "cosine"))
+    alpha = float(sampler_cfg.get("alpha", 1.0))
+    beta = float(sampler_cfg.get("beta", 1.0))
+    hib_raw = sampler_cfg.get("higher_is_better", None)
+    hib = bool(hib_raw) if isinstance(hib_raw, bool) else None
+    if hib is None:
+        conf_key = sampler_cfg.get("conf_key", sampler_cfg.get("by", None))
+        if conf_key is not None:
+            hib = _infer_higher_is_better_from_conf_key(str(conf_key))
+        else:
+            hib = False
+    return DensityWeightedUncertaintySampler(
+        seed=seed,
+        k_nn=k_nn,
+        metric=metric,
+        alpha=alpha,
+        beta=beta,
+        higher_is_better=bool(hib),
+    )
+
+
+@register_sampler("div_kmeans")
+def _factory_div_kmeans(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return _factory_kmeans_sampler(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+@register_sampler("kcenter")
+def _factory_kcenter(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    metric = str(sampler_cfg.get("metric", "cosine"))
+    return KCenterSampler(seed=seed, metric=metric)
+
+
+@register_sampler("div_kcenter")
+def _factory_div_kcenter(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return _factory_kcenter(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+@register_sampler("d2u_kmeans")
+def _factory_d2u_kmeans(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    k = sampler_cfg.get("k", None)
+    k = int(k) if k is not None else None
+    hib_raw = sampler_cfg.get("higher_is_better", None)
+    hib = bool(hib_raw) if isinstance(hib_raw, bool) else None
+    # If conf_key is available, infer direction as a default.
+    if hib is None:
+        conf_key = sampler_cfg.get("conf_key", sampler_cfg.get("by", None))
+        if conf_key is not None:
+            hib = _infer_higher_is_better_from_conf_key(str(conf_key))
+    return DivThenUncertaintySampler(seed=seed, k=k, higher_is_better=hib)
+
+
+@register_sampler("u2d_kmeans")
+def _factory_u2d_kmeans(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    # alias of HybridSampler (uncertainty -> kmeans diversity)
+    return _factory_hybrid_sampler(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+@register_sampler("hyb_u2d_kmeans")
+def _factory_hyb_u2d_kmeans(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return _factory_u2d_kmeans(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+@register_sampler("hyb_d2u_kmeans")
+def _factory_hyb_d2u_kmeans(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return _factory_d2u_kmeans(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+# Backward compat alias (previous patch name)
+@register_sampler("cluster_uncertainty")
+def _factory_cluster_uncertainty(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return _factory_d2u_kmeans(cfg=cfg, sampler_cfg=sampler_cfg, seed=seed)
+
+
+# ----------------------------------------------------------------------------
+# Future extensions (placeholders)
+# ----------------------------------------------------------------------------
+
+
+@register_sampler("qbc")
+def _factory_qbc_placeholder(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return NotImplementedSampler(
+        seed=seed,
+        name="qbc",
+        reason="Query-by-Committee requires committee disagreement scores (e.g., vote entropy) to be provided as pool_scores.",
+    )
+
+
+@register_sampler("badge")
+def _factory_badge_placeholder(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
+    return NotImplementedSampler(
+        seed=seed,
+        name="badge",
+        reason="BADGE requires gradient embeddings (gradients of loss w.r.t. last-layer) for each pool sample.",
+    )
+
 
 
 # 後方互換（基本は使わない方針）
@@ -484,8 +903,7 @@ def _factory_uncertainty_sampler(*, cfg: Mapping[str, Any], sampler_cfg: Mapping
 def _factory_kmeans_sampler(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str, Any], seed: Optional[int] = None) -> BaseSampler:
     k = sampler_cfg.get("k", None)
     k = int(k) if k is not None else None
-    round0 = str(sampler_cfg.get("round0", "random"))
-    return ClusteringSampler(seed=seed, k=k, round0=round0)
+    return ClusteringSampler(seed=seed, k=k)
 
 
 @register_sampler("hybrid")
@@ -493,8 +911,7 @@ def _factory_hybrid_sampler(*, cfg: Mapping[str, Any], sampler_cfg: Mapping[str,
     k = sampler_cfg.get("k", None)
     k = int(k) if k is not None else None
     ratio = float(sampler_cfg.get("sub_budget_ratio", 5.0))
-    round0 = str(sampler_cfg.get("round0", "msp"))
-    return HybridSampler(seed=seed, k=k, sub_budget_ratio=ratio, round0=round0)
+    return HybridSampler(seed=seed, k=k, sub_budget_ratio=ratio)
 
 
 # =============================================================================
@@ -506,6 +923,9 @@ def create_sampler(cfg: Mapping[str, Any]) -> BaseSampler:
     """
     cfg から Sampler を構築するファクトリ関数（フォールバック禁止・厳格）。
 
+    注意:
+      - round0 フォールバックは完全撤廃。埋め込み等の前提が満たされない場合は例外で停止。
+
     対応する設定形式:
       1) 文字列形式
          al:
@@ -516,7 +936,6 @@ def create_sampler(cfg: Mapping[str, Any]) -> BaseSampler:
            sampler:
              name: "kmeans"
              k: 32
-             round0: "msp"
     """
     al_cfg = cfg.get("al")
     if not isinstance(al_cfg, Mapping):
@@ -538,6 +957,8 @@ def create_sampler(cfg: Mapping[str, Any]) -> BaseSampler:
         if not name:
             raise ValueError("cfg['al']['sampler']['name'] が空文字です。")
         sampler_cfg = sampler_cfg_raw
+        if "round0" in sampler_cfg_raw:
+            raise ValueError("cfg['al']['sampler'] に 'round0' は指定できません（フォールバック完全撤廃）。設定から削除してください。")
     else:
         raise TypeError(f"cfg['al']['sampler'] は str か Mapping が必要です: got {type(sampler_cfg_raw)}")
 
@@ -638,12 +1059,9 @@ if __name__ == "__main__":
     s2 = UncertaintySampler(seed=42, by="msp", higher_is_better=False)
     print("msp(low first):", s2.select(st, scores=scores, budget=2))
 
-    # 4) kmeans round0 fallback (explicit)
-    s3 = ClusteringSampler(seed=42, k=2, round0="msp")
-    print("kmeans round0 via msp:", s3.select(st, scores=scores, budget=2))
-
     # 5) kmeans with embeddings (simulate round>=1)
     st.round_index = 1
+    s3 = ClusteringSampler(seed=42, k=2)
     feat_ids = ["a", "b", "c", "d"]
     feat = np.array([[0.0, 0.0], [10.0, 10.0], [0.1, 0.0], [9.9, 10.2]], dtype=float)
     print("kmeans:", s3.select(st, scores=None, budget=2, features=feat, feature_ids=feat_ids))
@@ -661,10 +1079,8 @@ python -m tensaku.al.sampler
 - 再現性: seed により Random/KMeans の決定論性を担保。
 - エラー処理: フォールバック禁止。条件不足は RuntimeError/ValueError で停止。
 - ロギング: logging.getLogger(__name__) + INFO/WARNING/ERROR を統一。
-- 拡張性: round0 の mode を追加しやすい（_select_round0 を拡張）。
 - 性能: numpy ベースで O(N) 前処理 + KMeans。大規模 N の場合は pipeline 側で候補圧縮推奨。
 - 改善アクション（<=3）:
   1) Hybrid の higher_is_better を cfg から明示的に渡せるようにする（いまは保守的推定）。
   2) feature_ids→index の辞書生成をキャッシュできる（同一 round で複数回呼ぶなら）。
-  3) round0 で scores が欠ける場合の診断ログをもう少し詳しくする。
 """

@@ -99,7 +99,7 @@ def _build_cfg_for_split(*, qid: str, ns) -> Dict[str, Any]:
         "data_dir": str((Path(ns.data_root) / f"q-{qid}" / ns.split_subdir).resolve()),
         "on_exist": "overwrite",  # overwrite mode explicitly
     }
-    data_cfg = {"input_all": str(Path(ns.input_all).resolve())}
+    data_cfg = {"qid": qid, "input_all": str(Path(ns.input_all).resolve())}
 
     split_cfg: Dict[str, Any] = {"seed": int(ns.seed), "stratify": bool(ns.stratify)}
 

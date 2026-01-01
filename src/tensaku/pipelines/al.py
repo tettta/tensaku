@@ -71,8 +71,6 @@ def run_experiment(cfg: Mapping[str, Any], *, layout: ExperimentLayout) -> int:
 
     _init_al_history(layout, state=state)
 
-    all_selected_rows: List[Dict[str, Any]] = []
-
     last_round = -1
     for r in range(rounds):
         last_round = r
@@ -141,7 +139,9 @@ def run_experiment(cfg: Mapping[str, Any], *, layout: ExperimentLayout) -> int:
 
         selected_rows = _rows_by_ids(split0.pool, id_key=id_key, ids=selected_ids)
         _save_selected_rows(layout, round_index=r, selected_rows=selected_rows)
-        all_selected_rows.extend(selected_rows)
+        _append_selected_all(layout, selected_rows=selected_rows)
+        # 早期に参照を切る（大きい列がある場合のメモリ高水位の抑制）
+        del selected_rows
 
         _append_al_history(layout, state=state, added=len(selected_ids))
 
@@ -157,7 +157,6 @@ def run_experiment(cfg: Mapping[str, Any], *, layout: ExperimentLayout) -> int:
         # Round-end cleanup (ledger + config driven; immediate deletion; no delayed cleanup)
         _ = clean_round_end(layout=layout, cfg=cfg_dict, round_index=r)
 
-    _save_selected_all(layout, selected_rows=all_selected_rows)
     if last_round >= 0:
         _finalize_experiment(layout, last_round=last_round)
 
@@ -344,10 +343,54 @@ def _save_selected_rows(layout: ExperimentLayout, *, round_index: int, selected_
     f.save_csv(rows=df.values.tolist(), header=list(df.columns), record=(not f.exists()))
 
 
-def _save_selected_all(layout: ExperimentLayout, *, selected_rows: List[Dict[str, Any]]) -> None:
+def _append_selected_all(layout: ExperimentLayout, *, selected_rows: List[Dict[str, Any]]) -> None:
+    """選択済みサンプル（行データ）を「全体」ファイルへ追記する。
+
+    目的
+    ---
+    - 以前は全round分の selected_rows を in-memory に蓄積して最後に一括保存していたが、
+      SASの行は本文・根拠配列などが重く、round数が増えるとRSSが増え続ける原因になりやすい。
+    - ここでは **メモリに蓄積せず**、roundごとに `selection/al_samples_all.csv` へ追記する。
+
+    仕様
+    ---
+    - 初回のみヘッダ付きで作成（layoutの記録=ledgerもこの時点で行う）。
+    - 2回目以降はファイル末尾へ追記する（ヘッダは再出力しない）。
+    - ヘッダ（列名）が変わった場合はサイレントに吸収せず、即エラー。
+    """
+    if not selected_rows:
+        return
+
     f = layout.selection_all_samples
     df = pd.DataFrame(selected_rows)
-    f.save_csv(rows=df.values.tolist(), header=list(df.columns), record=(not f.exists()))
+    cols = list(df.columns)
+
+    # 初回は layout 経由で作成して ledger に記録
+    if not f.exists():
+        f.save_csv(rows=df.values.tolist(), header=cols, record=True)
+        return
+
+    # 既存ヘッダを1行だけ読む（全体を pandas で読むと巨大化し得るため避ける）
+    try:
+        with f.path.open("r", encoding="utf-8", newline="") as rf:
+            reader = csv.reader(rf)
+            header = next(reader, None)
+    except Exception as e:
+        raise RuntimeError(f"failed to read header: {f.path}") from e
+
+    if not header:
+        raise RuntimeError(f"selection_all_samples is empty or header missing: {f.path}")
+
+    if header != cols:
+        raise RuntimeError(
+            "selection_all_samples header mismatch. "
+            f"file={f.path} file_header={header} current_cols={cols}"
+        )
+
+    # 追記
+    with f.path.open("a", encoding="utf-8", newline="") as wf:
+        writer = csv.writer(wf)
+        writer.writerows(df.values.tolist())
 
 
 def _finalize_experiment(layout: ExperimentLayout, *, last_round: int) -> None:

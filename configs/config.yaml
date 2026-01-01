@@ -1,79 +1,67 @@
 # configs/config.yaml
+# Main experiment config (Strict). Keep this file consistent: all defaults must exist.
+
 defaults:
   - _self_
-  - al: base           # al/trust.yaml を使用
-  - model: bert         # model/bert.yaml を使用
-  - train: standard     # train/standard.yaml を使用
-  - infer: base         # infer/base.yaml を使用
-  - data: base          # data/base.yaml を使用
-  - split: standard     # split/standard.yaml を使用
-  - confidence: default # confidence/default.yaml を使用
-  - gate: default       # gate/default.yaml を使用
-  - run: base           # run/base.yaml を使用（中身はAL専用の共通設定）
-  - cleaner: base       # cleaner/base.yaml
-  - task: sas           # task/sas.yaml を使用
+  - run: base
+  - data: base
+  - model: bert
+  - train: standard
+  - infer: base
+  - al: base
+  - confidence: default
+  - gate: default
+  - cleaner: base
   - viz: preset
-
-project_root: ${oc.env:TENSAKU_ROOT, .}}
+  - task: standard_supervised
+  - split: base
+  - split/mode: n_train
 
 hydra:
   run:
-    # 【変更】override_dirname を sampler の前に持ってくる
-    dir: ${project_root}/outputs/${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
-
+    # NOTE: use run.outputs_root (not project_root) to avoid missing-key issues.
+    dir: ${run.outputs_root}/${data.qid}/${split.subdir}/${run.recipe}/${run.tag}/${al.sampler.name}/seed=${run.seed}
   sweep:
-    dir: ${project_root}/outputs
-    
-    subdir: ${data.qid}/${run.tag}/${al.sampler.name}/seed=${run.seed}
-
+    dir: ${run.outputs_root}
+    subdir: ${data.qid}/${split.subdir}/${run.recipe}/${run.tag}/${al.sampler.name}/seed=${run.seed}
   job:
-    chdir: True
-
-    config:
-      override_dirname:
-
-        exclude_keys:
-          - run.project_root
-          - run.outputs_root
-          - run.seed
-          - data.qid
-          - al.sampler.name
-          - al/sampler
-          - run
-          - train
-          - model
-          - al
-          - infer
-          - data
-          - split
-          - confidence
-          - gate
-          - cleaner
-          - task
-          - dataset
-          
-          # --- 制御用変数 ---
-          - run.on_exist
-          - run.outputs_dir
-          - run.data_dir
-
+    chdir: true
+  # ログ設定（Hydra job_logging）
+  # - main.log: 既存どおり（INFO以上）
+  # - mem.log : メモリ監視用（tensaku.mem の DEBUG のみ）
+  #   * rootへは流さない（データ本文などが混ざる事故を防ぐ）
+  #   * ローテーションで肥大化を防ぐ
   job_logging:
-      version: 1
-      formatters:
-        simple:
-          format: "[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"
-
-      handlers:
-        console:
-          class: logging.StreamHandler
-          formatter: simple
-          stream: ext://sys.stdout
-        file:
-          class: logging.FileHandler
-          filename: main.log
-          formatter: simple
-
-      root:
-        level: INFO
-        handlers: [console, file]
-
+    version: 1
+    disable_existing_loggers: false
+    formatters:
+      simple:
+        format: "[%(asctime)s][%(name)s][%(levelname)s] - %(message)s"
+    handlers:
+      console:
+        class: logging.StreamHandler
+        formatter: simple
+        stream: ext://sys.stdout
+      file:
+        class: logging.FileHandler
+        formatter: simple
+        filename: main.log
+        mode: a
+        delay: true
+      mem_file:
+        class: logging.handlers.RotatingFileHandler
+        formatter: simple
+        filename: mem.log
+        mode: a
+        maxBytes: 5000000      # 5MB
+        backupCount: 5         # 直近5世代だけ保持
+        delay: true
+    # mem専用ロガー：ここだけDEBUG。rootへは伝播させない。
+    #loggers:
+      #tensaku.mem:
+        #level: DEBUG
+        #handlers: [mem_file]
+        #propagate: false
+    root:
+      level: INFO
+      handlers: [console, file]
